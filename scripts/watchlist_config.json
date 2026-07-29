@@ -2,107 +2,83 @@
   "alerts": [
     {
       "code": "sh000001",
-      "dir": "below",
       "name": "上证指数",
-      "note": "指数监控",
+      "target": null,
+      "dir": "below",
+      "target_pct": null,
+      "pct_dir": "both",
       "position": "",
-      "target": null
+      "note": "指数监控"
     },
     {
       "code": "sh510760",
-      "dir": "below",
       "name": "上证指数ETF国泰",
-      "note": "",
+      "target": null,
+      "dir": "below",
+      "target_pct": null,
+      "pct_dir": "both",
       "position": "",
-      "target": null
+      "note": ""
     },
     {
       "code": "sh510210",
-      "dir": "below",
       "name": "上证指数ETF富国",
-      "note": "",
+      "target": null,
+      "dir": "below",
+      "target_pct": null,
+      "pct_dir": "both",
       "position": "",
-      "target": null
+      "note": ""
     },
     {
       "code": "sh601398",
-      "dir": "below",
       "name": "工商银行",
-      "note": "",
+      "target": null,
+      "dir": "below",
+      "target_pct": null,
+      "pct_dir": "both",
       "position": "",
-      "target": null
+      "note": ""
     },
     {
       "code": "sh601288",
-      "dir": "below",
       "name": "农业银行",
-      "note": "",
+      "target": null,
+      "dir": "below",
+      "target_pct": null,
+      "pct_dir": "both",
       "position": "",
-      "target": null
+      "note": ""
     },
     {
       "code": "sh601988",
-      "dir": "below",
       "name": "中国银行",
-      "note": "",
+      "target": null,
+      "dir": "below",
+      "target_pct": null,
+      "pct_dir": "both",
       "position": "",
-      "target": null
+      "note": ""
     },
     {
       "code": "sh601939",
-      "dir": "below",
       "name": "建设银行",
-      "note": "",
+      "target": null,
+      "dir": "below",
+      "target_pct": null,
+      "pct_dir": "both",
       "position": "",
-      "target": null
+      "note": ""
     },
     {
       "code": "sh601899",
-      "dir": "below",
       "name": "紫金矿业",
-      "note": "",
-      "position": "",
-      "target": null
-    },
-    {
-      "code": "KORU",
+      "target": null,
       "dir": "below",
-      "name": "3倍做多韩国ETF-Direxion",
-      "note": "",
+      "target_pct": null,
+      "pct_dir": "both",
       "position": "",
-      "target": null
-    },
-    {
-      "code": "SPCX",
-      "dir": "below",
-      "name": "SpaceX",
-      "note": "",
-      "position": "",
-      "target": null
-    },
-    {
-      "code": "SOXX",
-      "dir": "below",
-      "name": "半导体ETF-iShares",
-      "note": "",
-      "position": "",
-      "target": null
-    },
-    {
-      "code": "QQQ",
-      "dir": "below",
-      "name": "纳斯达克100ETF-Invesco",
-      "note": "",
-      "position": "",
-      "target": null
-    },
-    {
-      "code": "SPY",
-      "dir": "below",
-      "name": "标普500ETF-SPDR",
-      "note": "",
-      "position": "",
-      "target": null
+      "note": ""
     }
   ],
   "interval": 5,

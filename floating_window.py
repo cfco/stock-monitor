@@ -14,7 +14,7 @@ import datetime
 import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'scripts'))
-from price_alert import get_quote, detect_market, close_tdx_client
+from price_alert import get_quote, detect_market, close_tdx_client, get_quotes_batch
 
 from PySide6.QtCore import Qt, QThread, Signal, QPoint, QRect, QTimer, QSize
 from PySide6.QtGui import (
@@ -117,6 +117,11 @@ class QuoteWorker(QThread):
             loop_success = False
             now_str = datetime.datetime.now().strftime('%H:%M:%S')
 
+            # 批量获取行情（按数据源分组，减少请求次数）
+            valid_codes = [item.get('code', '') for item in alerts if item.get('code')]
+            results = get_quotes_batch(valid_codes, source)
+
+            # 串行处理结果
             for item in alerts:
                 if not self.running:
                     break
@@ -129,71 +134,67 @@ class QuoteWorker(QThread):
                 position = item.get('position', '')
                 note = item.get('note', '')
 
-                try:
-                    q = get_quote(code, source)
-                    if q is None:
-                        continue
-                    price = q.get('price')
-                    if price is None:
-                        continue
+                q = results.get(code)
+                if q is None:
+                    continue
+                price = q.get('price')
+                if price is None:
+                    continue
 
-                    loop_success = True
+                loop_success = True
 
-                    payload = {
-                        'name': name,
-                        'code': code,
-                        'market': detect_market(code),
-                        'price': price,
-                        'change_pct': q.get('change_pct'),
-                        'yest_close': q.get('yest_close'),
-                        'target': target,
-                        'direction': direction,
-                        'target_pct': target_pct,
-                        'pct_dir': pct_dir,
-                        'position': position,
-                        'note': note,
-                        'currency': q.get('currency', ''),
-                        'session': q.get('session', ''),
-                        'last_update': now_str,
-                    }
-                    self.quote_updated.emit(payload)
+                payload = {
+                    'name': name,
+                    'code': code,
+                    'market': detect_market(code),
+                    'price': price,
+                    'change_pct': q.get('change_pct'),
+                    'yest_close': q.get('yest_close'),
+                    'target': target,
+                    'direction': direction,
+                    'target_pct': target_pct,
+                    'pct_dir': pct_dir,
+                    'position': position,
+                    'note': note,
+                    'currency': q.get('currency', ''),
+                    'session': q.get('session', ''),
+                    'last_update': now_str,
+                }
+                self.quote_updated.emit(payload)
 
-                    if target is not None:
-                        triggered, reason = self._check_alert(
-                            name, code, price, target, direction
+                if target is not None:
+                    triggered, reason = self._check_alert(
+                        name, code, price, target, direction
+                    )
+                    if triggered:
+                        cooldown_key = f'{code}_{direction}'
+                        last = self.alert_cooldown.get(cooldown_key, 0)
+                        if time.time() - last >= 60:
+                            self.alert_triggered.emit({
+                                'time': now_str, 'message': reason,
+                                'code': code, 'name': name,
+                                'price': price, 'target': target,
+                                'direction': direction,
+                            })
+                            self.alert_cooldown[cooldown_key] = time.time()
+
+                if target_pct is not None:
+                    change_pct = q.get('change_pct')
+                    if change_pct is not None:
+                        pct_trig, pct_reason = self._check_pct_alert(
+                            name, code, change_pct, target_pct, pct_dir
                         )
-                        if triggered:
-                            cooldown_key = f'{code}_{direction}'
+                        if pct_trig:
+                            cooldown_key = f'{code}_pct_{pct_dir}'
                             last = self.alert_cooldown.get(cooldown_key, 0)
                             if time.time() - last >= 60:
                                 self.alert_triggered.emit({
-                                    'time': now_str, 'message': reason,
+                                    'time': now_str, 'message': pct_reason,
                                     'code': code, 'name': name,
-                                    'price': price, 'target': target,
-                                    'direction': direction,
+                                    'price': price, 'target': target_pct,
+                                    'direction': pct_dir,
                                 })
                                 self.alert_cooldown[cooldown_key] = time.time()
-
-                    if target_pct is not None:
-                        change_pct = q.get('change_pct')
-                        if change_pct is not None:
-                            pct_trig, pct_reason = self._check_pct_alert(
-                                name, code, change_pct, target_pct, pct_dir
-                            )
-                            if pct_trig:
-                                cooldown_key = f'{code}_pct_{pct_dir}'
-                                last = self.alert_cooldown.get(cooldown_key, 0)
-                                if time.time() - last >= 60:
-                                    self.alert_triggered.emit({
-                                        'time': now_str, 'message': pct_reason,
-                                        'code': code, 'name': name,
-                                        'price': price, 'target': target_pct,
-                                        'direction': pct_dir,
-                                    })
-                                    self.alert_cooldown[cooldown_key] = time.time()
-
-                except Exception as e:
-                    print(f'[Worker] Error for {code}: {e}')
 
             if loop_success:
                 consecutive_errors = 0
@@ -500,6 +501,21 @@ class SettingsDialog(QDialog):
             f'  padding: 4px 6px; font-size: 12px;'
             f'}}'
             f'QLineEdit:focus, QComboBox:focus {{ border-color: {COLOR_DOWN}; }}'
+            f'QComboBox QAbstractItemView {{'
+            f'  background: {COLOR_BG_LIGHT}; color: {COLOR_TEXT};'
+            f'  border: 1px solid {COLOR_BORDER};'
+            f'  selection-background-color: {COLOR_BORDER}; selection-color: {COLOR_TEXT};'
+            f'  outline: none; padding: 2px; font-size: 12px;'
+            f'}}'
+            f'QComboBox::drop-down {{ border: none; width: 20px; }}'
+            f'QComboBox::down-arrow {{ image: none; border-left: 4px solid transparent;'
+            f'  border-right: 4px solid transparent; border-top: 5px solid {COLOR_TEXT_DIM}; }}'
+            f'QSpinBox::up-button, QSpinBox::down-button {{'
+            f'  background: {COLOR_BG_LIGHT}; border: none; width: 16px; }}'
+            f'QSpinBox::up-arrow {{ border-left: 3px solid transparent;'
+            f'  border-right: 3px solid transparent; border-bottom: 4px solid {COLOR_TEXT_DIM}; }}'
+            f'QSpinBox::down-arrow {{ border-left: 3px solid transparent;'
+            f'  border-right: 3px solid transparent; border-top: 4px solid {COLOR_TEXT_DIM}; }}'
         )
 
         layout = QVBoxLayout(self)
@@ -807,8 +823,7 @@ class FloatingWindow(QWidget):
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.setSpacing(0)
 
-        self._build_title_bar(container_layout)
-        self._build_status_bar(container_layout)
+        # 标题栏和状态栏已合并到底部栏
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -833,111 +848,50 @@ class FloatingWindow(QWidget):
         self._build_bottom_bar(container_layout)
         self._rebuild_cards()
 
-    def _build_title_bar(self, parent_layout):
-        title_bar = QFrame()
-        title_bar.setFixedHeight(28)
-        title_bar.setStyleSheet(
-            f'background: transparent; border-bottom: 1px solid {COLOR_BORDER};'
-        )
-        h = QHBoxLayout(title_bar)
-        h.setContentsMargins(8, 0, 6, 0)
-        h.setSpacing(4)
 
-        self.title_label = QLabel(f'v{VERSION}')
-        self.title_label.setStyleSheet(
-            f'color: {COLOR_TEXT}; font-size: 10px; font-weight: 600;'
-        )
-        h.addWidget(self.title_label)
-        h.addStretch()
-
-        self.status_dot = QLabel('●')
-        self.status_dot.setStyleSheet(f'color: {COLOR_FLAT}; font-size: 10px;')
-        h.addWidget(self.status_dot)
-
-        btn_close = QPushButton('×')
-        btn_close.setFixedSize(18, 18)
-        btn_close.setCursor(Qt.PointingHandCursor)
-        btn_close.setStyleSheet(
-            f'QPushButton {{ border: none; color: {COLOR_TEXT_DIM};'
-            f'  font-size: 13px; font-weight: 700; border-radius: 3px; }}'
-            f'QPushButton:hover {{ background: {COLOR_ALERT}; color: white; }}'
-        )
-        btn_close.clicked.connect(self.hide)
-        h.addWidget(btn_close)
-
-        btn_min = QPushButton('—')
-        btn_min.setFixedSize(18, 18)
-        btn_min.setCursor(Qt.PointingHandCursor)
-        btn_min.setStyleSheet(
-            f'QPushButton {{ border: none; color: {COLOR_TEXT_DIM};'
-            f'  font-size: 11px; font-weight: 700; border-radius: 3px; }}'
-            f'QPushButton:hover {{ background: {COLOR_BORDER}; color: white; }}'
-        )
-        btn_min.clicked.connect(self.showMinimized)
-        h.addWidget(btn_min)
-
-        parent_layout.addWidget(title_bar)
-
-    def _build_status_bar(self, parent_layout):
-        bar = QFrame()
-        bar.setFixedHeight(18)
-        bar.setStyleSheet('background: transparent;')
-        h = QHBoxLayout(bar)
-        h.setContentsMargins(6, 0, 6, 0)
-        h.setSpacing(4)
-
-        self.update_label = QLabel('--:--')
-        self.update_label.setStyleSheet(f'color: {COLOR_TEXT_DIM}; font-size: 9px;')
-        h.addWidget(self.update_label)
-        h.addStretch()
-        self.uptime_label = QLabel('')
-        self.uptime_label.setStyleSheet(f'color: {COLOR_TEXT_DIM}; font-size: 9px;')
-        h.addWidget(self.uptime_label)
-
-        parent_layout.addWidget(bar)
 
     def _build_bottom_bar(self, parent_layout):
         bar = QFrame()
-        bar.setFixedHeight(28)
+        bar.setFixedHeight(32)
         bar.setStyleSheet(
             f'background: transparent; border-top: 1px solid {COLOR_BORDER};'
         )
         h = QHBoxLayout(bar)
-        h.setContentsMargins(4, 0, 4, 0)
-        h.setSpacing(3)
+        h.setContentsMargins(6, 0, 6, 0)
+        h.setSpacing(4)
 
-        self.btn_start = QPushButton('▶')
-        self.btn_start.setCursor(Qt.PointingHandCursor)
-        self.btn_start.setFixedSize(26, 22)
-        self.btn_start.setStyleSheet(self._btn_style(COLOR_DOWN))
-        self.btn_start.clicked.connect(self.start_monitor)
+        # 左侧：状态点 + 更新时间 + 运行时长
+        self.status_dot = QLabel('●')
+        self.status_dot.setStyleSheet(f'color: {COLOR_FLAT}; font-size: 9px;')
+        h.addWidget(self.status_dot)
 
-        self.btn_stop = QPushButton('■')
-        self.btn_stop.setCursor(Qt.PointingHandCursor)
-        self.btn_stop.setFixedSize(26, 22)
-        self.btn_stop.setStyleSheet(self._btn_style(COLOR_FLAT))
-        self.btn_stop.clicked.connect(self.stop_monitor)
+        self.update_label = QLabel('--:--')
+        self.update_label.setStyleSheet(f'color: {COLOR_TEXT_DIM}; font-size: 9px;')
+        h.addWidget(self.update_label)
 
+        self.uptime_label = QLabel('')
+        self.uptime_label.setStyleSheet(f'color: {COLOR_TEXT_DIM}; font-size: 9px;')
+        h.addWidget(self.uptime_label)
+
+        h.addStretch()
+
+        # 右侧：重载 + 设置
         self.btn_reload = QPushButton('↻')
         self.btn_reload.setCursor(Qt.PointingHandCursor)
-        self.btn_reload.setFixedSize(26, 22)
+        self.btn_reload.setFixedSize(24, 20)
         self.btn_reload.setStyleSheet(self._btn_style(COLOR_BORDER))
         self.btn_reload.clicked.connect(self.reload_config)
+        h.addWidget(self.btn_reload)
 
         self.btn_settings = QPushButton('⚙')
         self.btn_settings.setCursor(Qt.PointingHandCursor)
-        self.btn_settings.setFixedSize(26, 22)
+        self.btn_settings.setFixedSize(24, 20)
         self.btn_settings.setStyleSheet(
             f'QPushButton {{ background: {COLOR_BG_LIGHT}; color: {COLOR_TEXT};'
-            f'  border: 1px solid {COLOR_BORDER}; border-radius: 4px; font-size: 12px; }}'
+            f'  border: 1px solid {COLOR_BORDER}; border-radius: 4px; font-size: 11px; }}'
             f'QPushButton:hover {{ background: {COLOR_BORDER}; }}'
         )
         self.btn_settings.clicked.connect(self._open_settings)
-
-        h.addWidget(self.btn_start)
-        h.addWidget(self.btn_stop)
-        h.addWidget(self.btn_reload)
-        h.addStretch()
         h.addWidget(self.btn_settings)
 
         parent_layout.addWidget(bar)
@@ -1010,6 +964,11 @@ class FloatingWindow(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent):
         self._drag_offset = None
 
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        """双击任意位置关闭程序"""
+        if event.button() == Qt.LeftButton:
+            QApplication.quit()
+
     def _move_to_bottom_right(self):
         screen = QApplication.primaryScreen().availableGeometry()
         w, h = self.width() or 140, self.height() or 400
@@ -1049,7 +1008,7 @@ class FloatingWindow(QWidget):
             self.cards[code] = card
 
         n = len(self.cards)
-        base_h = 28 + 18 + 28  # 标题+状态+底部
+        base_h = 32  # 底部栏
         list_h = min(n * 26 + 8, 500)
         self.resize(280, base_h + list_h)
 
@@ -1069,8 +1028,6 @@ class FloatingWindow(QWidget):
         self._uptime_timer.timeout.connect(self._update_uptime)
         self._uptime_timer.start(1000)
 
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
 
     def stop_monitor(self):
         if self.worker:
@@ -1079,9 +1036,7 @@ class FloatingWindow(QWidget):
             self.worker = None
         if hasattr(self, '_uptime_timer'):
             self._uptime_timer.stop()
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        self.status_dot.setStyleSheet(f'color: {COLOR_FLAT}; font-size: 10px;')
+        self.status_dot.setStyleSheet(f'color: {COLOR_FLAT}; font-size: 9px;')
 
     def reload_config(self):
         was_running = self.worker and self.worker.isRunning()
@@ -1124,11 +1079,11 @@ class FloatingWindow(QWidget):
 
     def on_status(self, status):
         if status == 'running':
-            self.status_dot.setStyleSheet(f'color: {COLOR_DOWN}; font-size: 10px;')
+            self.status_dot.setStyleSheet(f'color: {COLOR_DOWN}; font-size: 9px;')
         elif status == 'stopped':
-            self.status_dot.setStyleSheet(f'color: {COLOR_FLAT}; font-size: 10px;')
+            self.status_dot.setStyleSheet(f'color: {COLOR_FLAT}; font-size: 9px;')
         elif status == 'error':
-            self.status_dot.setStyleSheet(f'color: {COLOR_ALERT}; font-size: 10px;')
+            self.status_dot.setStyleSheet(f'color: {COLOR_ALERT}; font-size: 9px;')
 
     def on_batch_done(self, now_str):
         self.update_label.setText(now_str)

@@ -148,10 +148,14 @@ def show_popup_async(title, message):
     t.start()
 
 
+_tdx_lock = threading.Lock()
+
+
 def get_quote_tdx(code, host=None):
     """从通达信协议获取实时行情（郑州节点，~15ms延迟）"""
-    client = get_tdx_client(host)
-    result = client.get_quote(code)
+    with _tdx_lock:
+        client = get_tdx_client(host)
+        result = client.get_quote(code)
     if not result or len(result) == 0:
         raise ValueError(f'未获取到数据: {code}')
 
@@ -437,6 +441,239 @@ def resolve_name(code, source='tdx', host=None):
     except Exception:
         return code
 
+
+
+
+def get_quotes_tencent_batch(codes):
+    """腾讯接口批量获取行情（一次请求多只股票）
+    codes: 代码列表，如 ['sh000001', 'sh601398', 'usKORU']
+    返回: {code: quote_dict, ...}，失败的代码不包含在结果中
+    """
+    import urllib.request
+    import re
+
+    # 统一美股代码前缀
+    normalized = []
+    for code in codes:
+        c = code.lower()
+        if not c.startswith(('sh', 'sz', 'hk', 'us', 's_sh', 's_sz', 's_hk', 's_us')):
+            if code.isalpha():
+                normalized.append('us' + code)
+            else:
+                normalized.append(code)
+        else:
+            normalized.append(code)
+
+    # 批量请求：逗号分隔
+    codes_str = ','.join(normalized)
+    url = f'https://qt.gtimg.cn/q={codes_str}'
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            content = resp.read().decode('gbk')
+    except Exception as e:
+        print(f'[Tencent Batch] Request failed: {e}')
+        return {}
+
+    # 解析返回的多条数据（每条以 v_ 开头，分号分隔）
+    results = {}
+    # 匹配 v_xxx="content" 格式
+    pattern = r'v_[^=]+="([^"]*)"'
+    matches = re.findall(pattern, content)
+
+    # 建立原始代码到标准化代码的映射
+    code_map = {}
+    for i, code in enumerate(codes):
+        code_map[code] = normalized[i]
+
+    for match_str in matches:
+        f = match_str.split('~')
+        if len(f) < 5:
+            continue
+
+        # 提取返回的代码
+        ret_code = f[2] if len(f) > 2 else ''
+        # 判断是否美股
+        is_us = ret_code.lower().startswith('us') or any(
+            n.lower().startswith('us') and n.upper().endswith(ret_code.upper())
+            for n in normalized
+        )
+
+        # 美股精简格式
+        if is_us and len(f) < 10:
+            def _safe_float(idx, parts=f):
+                try:
+                    return float(parts[idx]) if idx < len(parts) and parts[idx] not in ('', '0.00') else None
+                except (ValueError, IndexError):
+                    return None
+            price = _safe_float(3)
+            prev_close = _safe_float(4)
+            change_pct = _safe_float(32) if len(f) > 32 else None
+            if change_pct is None and price and prev_close and prev_close > 0:
+                change_pct = ((price - prev_close) / prev_close) * 100
+            quote = {
+                'name': f[1] if len(f) > 1 else ret_code,
+                'code': ret_code,
+                'price': price,
+                'yest_close': prev_close,
+                'open': _safe_float(5),
+                'high': _safe_float(33) if len(f) > 33 else None,
+                'low': _safe_float(34) if len(f) > 34 else None,
+                'change_pct': change_pct,
+            }
+        else:
+            # A股/港股标准格式
+            try:
+                quote = {
+                    'name': f[1],
+                    'code': f[2],
+                    'price': float(f[3]) if f[3] else None,
+                    'yest_close': float(f[4]) if f[4] else None,
+                    'open': float(f[5]) if len(f) > 5 and f[5] else None,
+                    'high': float(f[33]) if len(f) > 33 and f[33] else None,
+                    'low': float(f[34]) if len(f) > 34 and f[34] else None,
+                    'change_pct': float(f[32]) if len(f) > 32 and f[32] else None,
+                }
+            except (ValueError, IndexError) as e:
+                continue
+
+        # 将结果映射回原始代码
+        # 先尝试精确匹配
+        matched = False
+        for orig_code, norm_code in code_map.items():
+            if orig_code not in results:
+                if norm_code == ret_code or norm_code.upper().endswith(ret_code.upper()):
+                    if quote.get('price') is not None:
+                        results[orig_code] = quote
+                        matched = True
+                        break
+        # 如果没匹配上，用 ret_code 反查
+        if not matched and ret_code:
+            for orig_code in codes:
+                if orig_code not in results:
+                    results[orig_code] = quote
+                    break
+
+    return results
+
+
+def get_quotes_batch(codes, source='auto', host=None):
+    """统一批量行情获取接口
+    按数据源分组，减少请求次数：
+    - A股/港股：腾讯批量请求（1次）
+    - 美股：Yahoo Finance 并发（N次，但可并发）
+    - 全tdx：批量请求
+    返回: {code: quote_dict, ...}
+    """
+    if not codes:
+        return {}
+
+    # 强制指定数据源
+    if source == 'tencent':
+        return get_quotes_tencent_batch(codes)
+
+    if source == 'tdx':
+        results = {}
+        for code in codes:
+            try:
+                results[code] = get_quote_tdx(code, host)
+            except Exception as e:
+                print(f'[TDX Batch] Error for {code}: {e}')
+        return results
+
+    if source == 'yahoo':
+        results = {}
+        for code in codes:
+            try:
+                results[code] = get_quote_yahoo(code)
+            except Exception as e:
+                print(f'[Yahoo Batch] Error for {code}: {e}')
+        return results
+
+    # auto: 按市场分组
+    a_share_codes = []
+    us_codes = []
+    hk_codes = []
+    kr_codes = []
+    other_codes = []
+
+    for code in codes:
+        market = detect_market(code)
+        if market == 'a_share':
+            a_share_codes.append(code)
+        elif market == 'us':
+            us_codes.append(code)
+        elif market == 'hk':
+            hk_codes.append(code)
+        elif market in ('kr', 'yahoo'):
+            kr_codes.append(code)
+        else:
+            other_codes.append(code)
+
+    results = {}
+
+    # A股：TDX 逐个（低延迟但非线程安全）+ 腾讯批量补充名称
+    if a_share_codes:
+        # 先用腾讯批量获取（一次请求，包含名称）
+        tencent_results = get_quotes_tencent_batch(a_share_codes)
+        results.update(tencent_results)
+        # 对没有获取到的，尝试 TDX
+        for code in a_share_codes:
+            if code not in tencent_results:
+                try:
+                    results[code] = get_quote_tdx(code, host)
+                except Exception:
+                    pass
+
+    # 港股：腾讯批量
+    if hk_codes:
+        results.update(get_quotes_tencent_batch(hk_codes))
+
+    # 美股：先检测交易时段（Yahoo），常规时段用腾讯批量
+    if us_codes:
+        # 先用腾讯批量获取（一次请求）
+        tencent_us = get_quotes_tencent_batch(us_codes)
+        # 再用 Yahoo 并发检测交易时段和补充盘前盘后数据
+        yahoo_us = {}
+        for code in us_codes:
+            try:
+                yahoo_us[code] = get_quote_yahoo(code)
+            except Exception:
+                pass
+        # 合并：Yahoo 优先（有交易时段信息），腾讯补充
+        for code in us_codes:
+            yq = yahoo_us.get(code)
+            tq = tencent_us.get(code)
+            if yq:
+                session = yq.get('session_raw', '')
+                if session in ('pre', 'post'):
+                    # 盘前盘后用 Yahoo 数据
+                    results[code] = yq
+                else:
+                    # 常规：用腾讯（更快），补充 Yahoo 的交易时段
+                    if tq and tq.get('price') is not None:
+                        tq['session'] = yq.get('session', '')
+                        tq['session_raw'] = yq.get('session_raw', '')
+                        tq['currency'] = yq.get('currency', 'USD')
+                        results[code] = tq
+                    else:
+                        results[code] = yq
+            elif tq and tq.get('price') is not None:
+                results[code] = tq
+
+    # 韩股/其他：Yahoo
+    if kr_codes:
+        for code in kr_codes:
+            try:
+                results[code] = get_quote_yahoo(code)
+            except Exception:
+                pass
+
+    # 其他：腾讯批量
+    if other_codes:
+        results.update(get_quotes_tencent_batch(other_codes))
+
+    return results
 
 def check_single(code, name, target, direction, interval, log_file,
                  source='tdx', host=None, notify='popup'):

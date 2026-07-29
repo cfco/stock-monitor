@@ -1,11 +1,9 @@
-[project]
-name = "stock-monitor-web-main"
+﻿[project]
+name = "stock-monitor"
 version = "0.1.0"
-description = "Stock Monitor 股票价格预警监控（Web版/桌面悬浮窗版 v4.0）"
-readme = "README.md"
+description = "Stock Monitor 桌面悬浮窗版 v5.0"
 requires-python = ">=3.10"
 dependencies = [
-    "flask>=2.3.0",
     "PySide6>=6.5.0",
     "eltdx>=0.1.0",
 ]
