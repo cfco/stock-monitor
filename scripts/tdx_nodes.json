@@ -1,0 +1,35 @@
+{
+  "nodes": [
+    {
+      "id": "zhengzhou_z1",
+      "name": "云行情郑州主站Z1",
+      "host": "182.118.8.4:7709",
+      "location": "郑州",
+      "priority": 1,
+      "status": "active"
+    },
+    {
+      "id": "shanghai_z1",
+      "name": "云行情上海主站Z1",
+      "host": "114.141.177.44:7709",
+      "location": "上海",
+      "priority": 2,
+      "status": "active"
+    },
+    {
+      "id": "beijing_z1",
+      "name": "云行情北京主站Z1",
+      "host": "123.125.108.103:7709",
+      "location": "北京",
+      "priority": 3,
+      "status": "active"
+    }
+  ],
+  "settings": {
+    "default_node": "zhengzhou_z1",
+    "auto_failover": true,
+    "failover_threshold_ms": 100,
+    "max_retries": 3,
+    "health_check_interval_s": 30
+  }
+}

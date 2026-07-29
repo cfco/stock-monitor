@@ -1,0 +1,110 @@
+{
+  "alerts": [
+    {
+      "code": "sh000001",
+      "dir": "below",
+      "name": "上证指数",
+      "note": "指数监控",
+      "position": "",
+      "target": null
+    },
+    {
+      "code": "sh510760",
+      "dir": "below",
+      "name": "上证指数ETF国泰",
+      "note": "",
+      "position": "",
+      "target": null
+    },
+    {
+      "code": "sh510210",
+      "dir": "below",
+      "name": "上证指数ETF富国",
+      "note": "",
+      "position": "",
+      "target": null
+    },
+    {
+      "code": "sh601398",
+      "dir": "below",
+      "name": "工商银行",
+      "note": "",
+      "position": "",
+      "target": null
+    },
+    {
+      "code": "sh601288",
+      "dir": "below",
+      "name": "农业银行",
+      "note": "",
+      "position": "",
+      "target": null
+    },
+    {
+      "code": "sh601988",
+      "dir": "below",
+      "name": "中国银行",
+      "note": "",
+      "position": "",
+      "target": null
+    },
+    {
+      "code": "sh601939",
+      "dir": "below",
+      "name": "建设银行",
+      "note": "",
+      "position": "",
+      "target": null
+    },
+    {
+      "code": "sh601899",
+      "dir": "below",
+      "name": "紫金矿业",
+      "note": "",
+      "position": "",
+      "target": null
+    },
+    {
+      "code": "KORU",
+      "dir": "below",
+      "name": "3倍做多韩国ETF-Direxion",
+      "note": "",
+      "position": "",
+      "target": null
+    },
+    {
+      "code": "SPCX",
+      "dir": "below",
+      "name": "SpaceX",
+      "note": "",
+      "position": "",
+      "target": null
+    },
+    {
+      "code": "SOXX",
+      "dir": "below",
+      "name": "半导体ETF-iShares",
+      "note": "",
+      "position": "",
+      "target": null
+    },
+    {
+      "code": "QQQ",
+      "dir": "below",
+      "name": "纳斯达克100ETF-Invesco",
+      "note": "",
+      "position": "",
+      "target": null
+    },
+    {
+      "code": "SPY",
+      "dir": "below",
+      "name": "标普500ETF-SPDR",
+      "note": "",
+      "position": "",
+      "target": null
+    }
+  ],
+  "interval": 5,
+  "source": "auto"
+}

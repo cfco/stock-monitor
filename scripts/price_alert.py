@@ -1,0 +1,696 @@
+#!/usr/bin/env python3
+"""
+price_alert.py — A股价格预警监控脚本 v2.0
+用法示例:
+  python price_alert.py --code sh601868 --target 2.90 --dir below
+  python price_alert.py --code sz000560 --target 2.60 --dir above --interval 15
+  python price_alert.py --config alert_config.json
+  python price_alert.py --code sh601868 --target 2.87 --dir below --source tencent
+
+数据源:
+  tdx       通达信协议直连（默认，~15ms延迟，郑州节点）
+  tencent   腾讯行情接口（备用，~155ms延迟）
+
+参数:
+  --code       股票代码 (如 sh601868, sz000560)
+  --name       股票名称 (可选，自动从接口获取)
+  --target     目标价格 (必填)
+  --dir        方向: below=跌破提醒, above=涨破提醒, both=双向提醒
+  --interval   检查间隔秒数 (默认5，配合tdx源15ms延迟足够)
+  --source     数据源: tdx(默认) | tencent
+  --host       自定义通达信服务器 (如 182.118.8.4:7709)
+  --config     JSON配置文件路径 (可同时监控多只股票)
+  --log        日志文件路径 (默认 reports/price_alert_日志.txt)
+  --notify     提醒方式: popup(默认弹窗) | log(仅日志)
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import datetime
+import subprocess
+import threading
+
+SCRIPT_DIR = None
+
+# ============================================================
+# TDX节点配置（多节点故障转移）
+# ============================================================
+
+# 节点列表（按优先级排序，老板优选低延迟节点）
+TDX_NODES = [
+    {'id': 'zhengzhou_z1', 'name': '云行情郑州主站Z1', 'host': '182.118.8.4:7709', 'priority': 1},
+    {'id': 'shanghai_z1', 'name': '云行情上海主站Z1', 'host': '114.141.177.44:7709', 'priority': 2},
+    {'id': 'beijing_z1', 'name': '云行情北京主站Z1', 'host': '123.125.108.103:7709', 'priority': 3},
+]
+
+# 默认节点（郑州主站，延迟最低）
+DEFAULT_TDX_HOST = '182.118.8.4:7709'
+DEFAULT_TDX_NODE_NAME = '云行情郑州主站Z1'
+
+# 全局eltdx客户端（连接复用）
+_tdx_client = None
+_current_node = None
+_failed_nodes = set()
+
+
+def get_tdx_client(host=None):
+    """获取或创建eltdx客户端（单例，连接复用，支持故障转移）"""
+    global _tdx_client, _current_node
+
+    # 如果指定了host且当前连接不是该host，重新连接
+    if host and _current_node != host:
+        close_tdx_client()
+
+    if _tdx_client is not None:
+        return _tdx_client
+
+    from eltdx import Client
+
+    # 如果指定了host，直接连接
+    if host:
+        _tdx_client = Client(host=host)
+        _current_node = host
+        return _tdx_client
+
+    # 否则按优先级选择节点
+    for node in TDX_NODES:
+        if node['host'] in _failed_nodes:
+            continue
+        try:
+            _tdx_client = Client(host=node['host'])
+            _current_node = node['host']
+            print(f'[TDX] Connected to {node["name"]} ({node["host"]})')
+            return _tdx_client
+        except Exception as e:
+            print(f'[TDX] Failed to connect {node["name"]}: {e}')
+            _failed_nodes.add(node['host'])
+
+    # 所有节点都失败，重置并重试第一个
+    _failed_nodes.clear()
+    raise ConnectionError('All TDX nodes failed')
+
+
+def close_tdx_client():
+    """关闭eltdx连接"""
+    global _tdx_client, _current_node
+    if _tdx_client is not None:
+        try:
+            _tdx_client.close()
+        except Exception:
+            pass
+        _tdx_client = None
+        _current_node = None
+
+
+def get_current_node_info():
+    """获取当前连接的节点信息"""
+    if _current_node:
+        for node in TDX_NODES:
+            if node['host'] == _current_node:
+                return node
+    return {'id': 'unknown', 'name': '未连接', 'host': 'N/A'}
+
+
+def get_available_nodes():
+    """获取所有可用节点列表"""
+    return [n for n in TDX_NODES if n['host'] not in _failed_nodes]
+
+
+def show_popup(title, message):
+    """Windows本地弹窗通知（零依赖，ctypes调用原生API）"""
+    try:
+        import ctypes
+        # MB_ICONWARNING = 0x30, MB_OK = 0x00
+        ctypes.windll.user32.MessageBoxW(0, message, title, 0x30)
+    except Exception:
+        # 如果MessageBox不可用，回退到PowerShell弹窗
+        try:
+            ps_cmd = (
+                f'Add-Type -AssemblyName System.Windows.Forms; '
+                f'[System.Windows.Forms.MessageBox]::Show("{message}", "{title}", '
+                f'[System.Windows.Forms.MessageBoxButtons]::OK, '
+                f'[System.Windows.Forms.MessageBoxIcon]::Warning)'
+            )
+            subprocess.Popen(
+                ['powershell', '-NoProfile', '-Command', ps_cmd],
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        except Exception:
+            print(f'[POPUP FAILED] {title}: {message}')
+
+
+def show_popup_async(title, message):
+    """异步弹窗（不阻塞监控循环）"""
+    t = threading.Thread(target=show_popup, args=(title, message), daemon=True)
+    t.start()
+
+
+def get_quote_tdx(code, host=None):
+    """从通达信协议获取实时行情（郑州节点，~15ms延迟）"""
+    client = get_tdx_client(host)
+    result = client.get_quote(code)
+    if not result or len(result) == 0:
+        raise ValueError(f'未获取到数据: {code}')
+
+    q = result[0]
+    # 计算涨跌幅
+    pre_close = q.pre_close_price
+    last_price = q.last_price
+    change_pct = None
+    if pre_close and pre_close > 0:
+        change_pct = ((last_price - pre_close) / pre_close) * 100
+
+    return {
+        'name': code,  # tdx协议不返回名称，用code
+        'code': code,
+        'price': last_price,
+        'yest_close': pre_close,
+        'open': q.open_price,
+        'high': q.high_price,
+        'low': q.low_price,
+        'volume': q.total_hand,
+        'amount': q.amount,
+        'change_pct': change_pct,
+        # 盘口
+        'bid1': q.buy_levels[0].price if q.buy_levels else None,
+        'bid1_vol': q.buy_levels[0].volume if q.buy_levels else None,
+        'ask1': q.sell_levels[0].price if q.sell_levels else None,
+        'ask1_vol': q.sell_levels[0].volume if q.sell_levels else None,
+    }
+
+
+def get_quote_tencent(code):
+    """从腾讯接口获取实时行情（备用，~155ms延迟）
+    支持 A股(sh/sz)、港股(hk)、美股(us)。
+    注意：美股返回字段顺序与A股不同，本函数自动适配。
+    """
+    import urllib.request
+    # 美股代码统一加 us 前缀（兼容用户写 usAAPL 或直接 AAPL）
+    if not code.lower().startswith(('sh', 'sz', 'hk', 'us', 's_sh', 's_sz', 's_hk', 's_us')):
+        # 字母代码默认视为美股
+        if code.isalpha():
+            code = 'us' + code
+    url = f'https://qt.gtimg.cn/q={code}'
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        content = resp.read().decode('gbk')
+
+    # 美股返回格式与A股不同：字段数少，无~分隔的完整结构
+    # 格式示例：v_usAAPL="100~Apple~AAPL~170.50~169.30~171.00~..."; 末尾有涨跌幅等
+    is_us = code.lower().startswith('us') or code.lower().startswith('s_us')
+    f = content.split('~')
+
+    if is_us and len(f) < 10:
+        # 美股精简格式，尝试正则提取
+        import re
+        m = re.search(r'"([^"]+)"', content)
+        if not m:
+            raise ValueError(f'腾讯接口返回格式异常: {content[:100]}')
+        parts = m.group(1).split('~')
+        # 美股典型字段：marketCode~name~symbol~price~prevClose~open~high~low~...~changePct
+        def _safe_float(idx):
+            try:
+                return float(parts[idx]) if idx < len(parts) and parts[idx] not in ('', '0.00') else None
+            except (ValueError, IndexError):
+                return None
+        price = _safe_float(3)
+        prev_close = _safe_float(4)
+        change_pct = _safe_float(32) if len(parts) > 32 else None
+        # 美股涨跌幅可能字段位置不同，如果取不到，用 price/prev_close 计算
+        if change_pct is None and price and prev_close and prev_close > 0:
+            change_pct = ((price - prev_close) / prev_close) * 100
+        return {
+            'name': parts[1] if len(parts) > 1 else code,
+            'code': parts[2] if len(parts) > 2 else code,
+            'price': price,
+            'yest_close': prev_close,
+            'open': _safe_float(5),
+            'high': _safe_float(33) if len(parts) > 33 else None,
+            'low': _safe_float(34) if len(parts) > 34 else None,
+            'change_pct': change_pct,
+        }
+
+    # A股/港股标准格式
+    return {
+        'name': f[1],
+        'code': f[2],
+        'price': float(f[3]),
+        'yest_close': float(f[4]),
+        'open': float(f[5]) if f[5] else None,
+        'high': float(f[33]) if len(f) > 33 and f[33] else None,
+        'low': float(f[34]) if len(f) > 34 and f[34] else None,
+        'change_pct': float(f[32]) if len(f) > 32 and f[32] else None,
+    }
+
+
+def _detect_trading_session(meta):
+    """根据 Yahoo meta 信息判断当前交易时段
+    返回: 'pre' | 'regular' | 'post' | 'closed'
+    """
+    import time as _time
+    now = _time.time()
+    periods = meta.get('currentTradingPeriod', {})
+    if not periods:
+        return 'closed'
+    # 检查盘前
+    pre = periods.get('pre', {})
+    if pre and pre.get('start') and pre.get('end'):
+        if pre['start'] <= now <= pre['end']:
+            return 'pre'
+    # 检查常规
+    reg = periods.get('regular', {})
+    if reg and reg.get('start') and reg.get('end'):
+        if reg['start'] <= now <= reg['end']:
+            return 'regular'
+    # 检查盘后
+    post = periods.get('post', {})
+    if post and post.get('start') and post.get('end'):
+        if post['start'] <= now <= post['end']:
+            return 'post'
+    return 'closed'
+
+
+def get_quote_yahoo(code):
+    """从 Yahoo Finance 获取实时行情（支持全球市场：韩股/美股/港股/欧股等）
+    韩股代码格式：005930.KS (KOSPI) / 052690.KQ (KOSDAQ)
+    美股代码格式：AAPL / TSLA
+    港股代码格式：0700.HK
+
+    自动识别盘前/盘后交易时段，返回对应价格。
+    """
+    import urllib.request
+    import json as _json
+    # 自动加韩股后缀：kr005930 → 005930.KS
+    symbol = code
+    if code.lower().startswith('kr'):
+        num = code[2:]
+        # 6位数字且以0开头默认KOSPI(.KS)，否则KOSDAQ(.KQ)
+        symbol = f'{num}.KS' if num.startswith('0') and len(num) == 6 else f'{num}.KQ'
+
+    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=2m&range=1d'
+    req = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    })
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        data = _json.loads(resp.read().decode('utf-8'))
+
+    result = data.get('chart', {}).get('result')
+    if not result:
+        raise ValueError(f'Yahoo接口未返回数据: {symbol}')
+    meta = result[0].get('meta', {})
+    indicators = result[0].get('indicators', {})
+    quotes = indicators.get('quotes', [{}])[0]
+
+    # 检测交易时段，选择最合适的价格
+    session = _detect_trading_session(meta)
+    session_label = {
+        'pre': '盘前', 'regular': '常规', 'post': '盘后', 'closed': '已休市'
+    }.get(session, '')
+
+    # 按时段选择价格：盘前用 preMarketPrice，盘后用 postMarketPrice
+    # 常规交易和休市用 regularMarketPrice
+    pre_price = meta.get('preMarketPrice')
+    post_price = meta.get('postMarketPrice')
+    reg_price = meta.get('regularMarketPrice')
+
+    if session == 'pre' and pre_price:
+        price = pre_price
+    elif session == 'post' and post_price:
+        price = post_price
+    else:
+        price = reg_price
+
+    prev_close = meta.get('chartPreviousClose') or meta.get('previousClose')
+    change_pct = None
+    if price and prev_close and prev_close > 0:
+        change_pct = ((price - prev_close) / prev_close) * 100
+
+    # 从日内报价数组取 open/high/low（可能为空数组）
+    opens = quotes.get('open') or []
+    highs = quotes.get('high') or []
+    lows = quotes.get('low') or []
+    valid_open = next((v for v in opens if v is not None), None)
+    valid_high = max([v for v in highs if v is not None], default=None)
+    valid_low = min([v for v in lows if v is not None], default=None)
+
+    # 52周高低
+    week52_high = meta.get('fiftyTwoWeekHigh')
+    week52_low = meta.get('fiftyTwoWeekLow')
+
+    return {
+        'name': meta.get('symbol', symbol),
+        'code': symbol,
+        'price': price,
+        'yest_close': prev_close,
+        'open': valid_open,
+        'high': valid_high,
+        'low': valid_low,
+        'change_pct': change_pct,
+        'currency': meta.get('currency', ''),
+        'session': session_label,       # 交易时段标签
+        'session_raw': session,         # 原始时段标识
+        'pre_market_price': pre_price,  # 盘前价（参考）
+        'post_market_price': post_price,# 盘后价（参考）
+        'week52_high': week52_high,
+        'week52_low': week52_low,
+    }
+
+
+def detect_market(code):
+    """根据代码格式自动识别市场
+    返回: 'a_share' | 'hk' | 'us' | 'kr' | 'yahoo' | 'unknown'
+    """
+    c = code.lower()
+    if c.startswith(('sh', 'sz')):
+        return 'a_share'
+    if c.startswith('hk'):
+        return 'hk'
+    if c.startswith('us') and len(c) > 2 and not c[2:].isdigit():
+        return 'us'
+    if c.startswith('kr'):
+        return 'kr'
+    # 直接 Yahoo 格式（包含点号）：005930.KS / AAPL / 0700.HK
+    if '.' in code:
+        return 'yahoo'
+    # 纯字母视为美股
+    if code.isalpha():
+        return 'us'
+    return 'unknown'
+
+
+def get_quote(code, source='auto', host=None):
+    """统一行情获取接口（自动路由）
+    source:
+      auto    - 根据代码格式自动选择（默认）
+      tdx     - 强制通达信协议（仅A股）
+      tencent - 强制腾讯接口（A股/港股/美股）
+      yahoo   - 强制Yahoo Finance（全球市场，推荐韩股）
+    """
+    if source == 'tdx':
+        return get_quote_tdx(code, host)
+    if source == 'tencent':
+        return get_quote_tencent(code)
+    if source == 'yahoo':
+        return get_quote_yahoo(code)
+
+    # auto: 根据市场路由
+    market = detect_market(code)
+    if market == 'a_share':
+        # A股优先 TDX（低延迟），失败回退腾讯
+        try:
+            return get_quote_tdx(code, host)
+        except Exception:
+            return get_quote_tencent(code)
+    if market == 'us':
+        # 美股：盘前/盘后时段优先 Yahoo（支持盘前盘后数据），常规时段用腾讯（更快）
+        try:
+            q_yahoo = get_quote_yahoo(code)
+            session = q_yahoo.get('session_raw', '')
+            if session in ('pre', 'post'):
+                # 盘前/盘后：Yahoo 数据更准确
+                return q_yahoo
+            # 常规交易或休市：用腾讯接口（更快），但如果腾讯失败则用 Yahoo
+            try:
+                return get_quote_tencent(code)
+            except Exception:
+                return q_yahoo
+        except Exception:
+            return get_quote_tencent(code)
+    if market == 'hk':
+        # 港股：腾讯接口即可
+        return get_quote_tencent(code)
+    if market in ('kr', 'yahoo'):
+        # 韩股/其他市场：Yahoo Finance
+        return get_quote_yahoo(code)
+    # 未知市场，尝试腾讯
+    return get_quote_tencent(code)
+
+
+def resolve_name(code, source='tdx', host=None):
+    """获取股票名称（tdx协议不返回名称，用腾讯接口补充）"""
+    try:
+        q = get_quote_tencent(code)
+        return q.get('name', code)
+    except Exception:
+        return code
+
+
+def check_single(code, name, target, direction, interval, log_file,
+                 source='tdx', host=None, notify='popup'):
+    """监控单只股票"""
+    source_label = f'TDX({host or DEFAULT_TDX_HOST})' if source == 'tdx' else 'Tencent'
+    print(f'========================================')
+    print(f'  PRICE ALERT MONITOR v2.0')
+    print(f'  {name} ({code})')
+    if direction == 'below':
+        print(f'  Condition: price <= {target}')
+    elif direction == 'above':
+        print(f'  Condition: price >= {target}')
+    else:
+        print(f'  Condition: price <= {target} OR price >= {target}')
+    print(f'  Source: {source_label} | Interval: {interval}s')
+    print(f'  Started: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    print(f'========================================')
+    print()
+
+    alert_below = direction in ('below', 'both')
+    alert_above = direction in ('above', 'both')
+    check_count = 0
+
+    while True:
+        try:
+            q = get_quote(code, source, host)
+            price = q['price']
+            if price is None:
+                print(f'[{datetime.datetime.now().strftime("%H:%M:%S")}] Price is None, skipping...')
+                time.sleep(interval)
+                continue
+            name = q['name']
+            now = datetime.datetime.now().strftime('%H:%M:%S')
+            check_count += 1
+
+            triggered = False
+            reasons = []
+
+            if alert_below and price <= target:
+                triggered = True
+                reasons.append(f'price {price:.2f} <= target {target}')
+            if alert_above and price >= target:
+                triggered = True
+                reasons.append(f'price {price:.2f} >= target {target}')
+
+            if triggered:
+                diff = price - target
+                direction_cn = '跌破' if diff <= 0 else '涨破'
+                pct_str = f'{q["change_pct"]:+.2f}%' if q.get('change_pct') is not None else 'N/A'
+                alert_line = (
+                    f'[{now}] *** ALERT *** {name}({code}) '
+                    f'{direction_cn} {target} | 当前价: {price:.2f} | '
+                    f'涨跌: {pct_str}'
+                )
+                print(alert_line)
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    f.write(alert_line + '\n')
+                # 弹窗通知
+                if notify == 'popup':
+                    popup_msg = (
+                        f'{name}({code}) {direction_cn} {target}\n'
+                        f'当前价: {price:.2f}\n'
+                        f'涨跌幅: {pct_str}\n'
+                        f'时间: {now}'
+                    )
+                    show_popup_async(f'价格预警 - {name}', popup_msg)
+                # 触发后继续监控，但降低频率到60秒
+                print(f'[{now}] Alert saved. Continuing monitor at 60s interval...')
+                time.sleep(60)
+                continue
+            else:
+                diff = price - target
+                pct_str = f'{q["change_pct"]:+.2f}%' if q.get('change_pct') is not None else ''
+                status = f'diff: {abs(diff):.2f}'
+                if pct_str:
+                    status += f' | {pct_str}'
+                print(f'[{now}] #{check_count} {name} = {price:.2f} ({status}) [OK]')
+
+        except Exception as e:
+            now = datetime.datetime.now().strftime('%H:%M:%S')
+            print(f'[{now}] Error: {e}')
+            # tdx连接失败时尝试重连
+            if source == 'tdx':
+                close_tdx_client()
+            time.sleep(interval)
+            continue
+
+        time.sleep(interval)
+
+
+def check_multi(config_file, source='tdx', host=None, notify='popup'):
+    """从JSON配置文件监控多只股票"""
+    with open(config_file, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+
+    interval = config.get('interval', 5)
+    log_file = config.get('log', get_log_path('multi'))
+    items = config.get('alerts', [])
+
+    source_label = f'TDX({host or DEFAULT_TDX_HOST})' if source == 'tdx' else 'Tencent'
+    print(f'========================================')
+    print(f'  MULTI-STOCK PRICE ALERT MONITOR v2.0')
+    print(f'  Monitoring {len(items)} stock(s)')
+    print(f'  Source: {source_label} | Interval: {interval}s')
+    print(f'  Started: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    print(f'========================================')
+    print()
+
+    # 记录已触发的预警（避免重复刷屏，每60秒冷却）
+    alert_cooldown = {}
+
+    while True:
+        now_str = datetime.datetime.now().strftime('%H:%M:%S')
+
+        for item in items:
+            code = item['code']
+            target = item['target']
+            direction = item.get('dir', 'below')
+            name = item.get('name', code)
+            alert_below = direction in ('below', 'both')
+            alert_above = direction in ('above', 'both')
+
+            try:
+                q = get_quote(code, source, host)
+                price = q.get('price')
+                if price is None:
+                    print(f'[{now_str}] {name}({code}) Price is None, skipping')
+                    continue
+                name = q.get('name', name)
+
+                triggered = False
+                reason = ''
+
+                if alert_below and price <= target:
+                    triggered = True
+                    reason = f'{name}({code}) 跌破 {target} | 当前: {price:.2f}'
+                if alert_above and price >= target:
+                    triggered = True
+                    reason = f'{name}({code}) 涨破 {target} | 当前: {price:.2f}'
+
+                if triggered:
+                    # 冷却检查
+                    cooldown_key = f'{code}_{direction}'
+                    last_alert_time = alert_cooldown.get(cooldown_key, 0)
+                    current_time = time.time()
+
+                    if current_time - last_alert_time >= 60:
+                        alert_line = f'[{now_str}] *** ALERT *** {reason}'
+                        print(alert_line)
+                        with open(log_file, 'a', encoding='utf-8') as f:
+                            f.write(alert_line + '\n')
+                        alert_cooldown[cooldown_key] = current_time
+                        if notify == 'popup':
+                            show_popup_async('价格预警', reason)
+                else:
+                    diff = price - target
+                    print(f'[{now_str}] {name} = {price:.2f} (target: {target}, diff: {abs(diff):.2f})')
+
+            except Exception as e:
+                print(f'[{now_str}] {name}({code}) Error: {e}')
+                if source == 'tdx':
+                    close_tdx_client()
+
+        time.sleep(interval)
+
+
+def get_log_path(label):
+    """生成日志文件路径"""
+    reports_dir = os.path.join(SCRIPT_DIR or '.', 'reports')
+    os.makedirs(reports_dir, exist_ok=True)
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    return os.path.join(reports_dir, f'price_alert_{label}_{today}.txt')
+
+
+def main():
+    global SCRIPT_DIR
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+    parser = argparse.ArgumentParser(
+        description='A股价格预警监控 v2.0（通达信协议/腾讯接口双源）',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  # 单只：中国能建跌破2.90提醒（默认用通达信郑州节点，~15ms）
+  python price_alert.py --code sh601868 --target 2.90 --dir below
+
+  # 每3秒检查一次（配合tdx源极速响应）
+  python price_alert.py --code sh601868 --target 2.87 --dir below --interval 3
+
+  # 强制使用腾讯接口
+  python price_alert.py --code sh601868 --target 2.90 --dir below --source tencent
+
+  # 指定其他通达信服务器
+  python price_alert.py --code sh601868 --target 2.90 --dir below --host 123.125.108.103:7709
+
+  # 双向：上海建工跌破2.45或涨破2.55都提醒
+  python price_alert.py --code sh600170 --target 2.45 --dir both
+
+  # 多只：用配置文件
+  python price_alert.py --config my_alerts.json
+
+JSON配置文件格式:
+{
+  "interval": 5,
+  "source": "tdx",
+  "log": "reports/my_alerts.txt",
+  "alerts": [
+    {"code": "sh601868", "name": "中国能建", "target": 2.90, "dir": "below"},
+    {"code": "sz000560", "name": "我爱我家", "target": 2.65, "dir": "above"}
+  ]
+}
+        """
+    )
+
+    parser.add_argument('--code', type=str, help='股票代码 (如 sh601868)')
+    parser.add_argument('--name', type=str, default='', help='股票名称 (可选，自动获取)')
+    parser.add_argument('--target', type=float, help='目标价格')
+    parser.add_argument('--dir', type=str, default='below',
+                        choices=['below', 'above', 'both'],
+                        help='方向: below=跌破, above=涨破, both=双向')
+    parser.add_argument('--interval', type=int, default=5, help='检查间隔秒数 (默认5)')
+    parser.add_argument('--source', type=str, default='tdx',
+                        choices=['tdx', 'tencent'],
+                        help='数据源: tdx=通达信协议(默认,~15ms) | tencent=腾讯接口(~155ms)')
+    parser.add_argument('--host', type=str, default='',
+                        help='通达信服务器地址 (如 182.118.8.4:7709，默认郑州节点)')
+    parser.add_argument('--log', type=str, default='', help='日志文件路径 (默认自动生成)')
+    parser.add_argument('--config', type=str, help='JSON配置文件路径 (监控多只股票)')
+    parser.add_argument('--notify', type=str, default='popup',
+                        choices=['popup', 'log'],
+                        help='提醒方式: popup=本地弹窗(默认) | log=仅写日志文件')
+
+    args = parser.parse_args()
+
+    if args.config:
+        check_multi(args.config, args.source, args.host or None, args.notify)
+    elif args.code and args.target:
+        if not args.name:
+            try:
+                args.name = resolve_name(args.code, args.source, args.host or None)
+            except Exception:
+                args.name = args.code
+
+        log_file = args.log or get_log_path(args.code)
+        try:
+            check_single(args.code, args.name, args.target, args.dir,
+                           args.interval, log_file, args.source,
+                           args.host or None, args.notify)
+        finally:
+            close_tdx_client()
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
