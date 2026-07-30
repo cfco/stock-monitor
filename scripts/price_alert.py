@@ -291,10 +291,10 @@ def get_quote_yahoo(code):
     symbol = code
     if code.lower().startswith('kr'):
         num = code[2:]
-        # 6位数字且以0开头默认KOSPI(.KS)，否则KOSDAQ(.KQ)
         symbol = f'{num}.KS' if num.startswith('0') and len(num) == 6 else f'{num}.KQ'
 
-    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=2m&range=1d'
+    # includePrePost=true 包含盘前盘后数据点
+    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=2m&range=1d&includePrePost=true'
     req = urllib.request.Request(url, headers={
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     })
@@ -307,6 +307,7 @@ def get_quote_yahoo(code):
     meta = result[0].get('meta', {})
     indicators = result[0].get('indicators', {})
     quotes = indicators.get('quotes', [{}])[0]
+    timestamps = result[0].get('timestamp', [])
 
     # 检测交易时段，选择最合适的价格
     session = _detect_trading_session(meta)
@@ -314,16 +315,25 @@ def get_quote_yahoo(code):
         'pre': '盘前', 'regular': '常规', 'post': '盘后', 'closed': '已休市'
     }.get(session, '')
 
-    # 按时段选择价格：盘前用 preMarketPrice，盘后用 postMarketPrice
-    # 常规交易和休市用 regularMarketPrice
+    # 各时段价格
     pre_price = meta.get('preMarketPrice')
     post_price = meta.get('postMarketPrice')
     reg_price = meta.get('regularMarketPrice')
 
-    if session == 'pre' and pre_price:
-        price = pre_price
-    elif session == 'post' and post_price:
-        price = post_price
+    # 如果在盘前/盘后但 meta 中没有对应价格，从 chart 数据点中提取
+    if session in ('pre', 'post'):
+        latest_price = _get_latest_chart_price(timestamps, quotes, meta, session)
+        if session == 'pre' and not pre_price:
+            pre_price = latest_price
+        if session == 'post' and not post_price:
+            post_price = latest_price
+        # 如果有盘前盘后价格，优先使用
+        if session == 'pre' and pre_price:
+            price = pre_price
+        elif session == 'post' and post_price:
+            price = post_price
+        else:
+            price = reg_price
     else:
         price = reg_price
 
@@ -332,7 +342,7 @@ def get_quote_yahoo(code):
     if price and prev_close and prev_close > 0:
         change_pct = ((price - prev_close) / prev_close) * 100
 
-    # 从日内报价数组取 open/high/low（可能为空数组）
+    # 从日内报价数组取 open/high/low
     opens = quotes.get('open') or []
     highs = quotes.get('high') or []
     lows = quotes.get('low') or []
@@ -340,9 +350,25 @@ def get_quote_yahoo(code):
     valid_high = max([v for v in highs if v is not None], default=None)
     valid_low = min([v for v in lows if v is not None], default=None)
 
-    # 52周高低
     week52_high = meta.get('fiftyTwoWeekHigh')
     week52_low = meta.get('fiftyTwoWeekLow')
+
+    # Parse klines from chart data (already fetched, no extra request)
+    klines = []
+    closes_list = quotes.get('close') or []
+    if timestamps and closes_list:
+        for i in range(len(timestamps)):
+            o = opens[i] if i < len(opens) else None
+            h = highs[i] if i < len(highs) else None
+            l = lows[i] if i < len(lows) else None
+            c = closes_list[i] if i < len(closes_list) else None
+            v = (quotes.get('volume') or [])
+            vol = v[i] if i < len(v) else 0
+            if o is not None and h is not None and l is not None and c is not None:
+                klines.append({
+                    'time': datetime.datetime.fromtimestamp(timestamps[i]).strftime('%H:%M'),
+                    'open': o, 'high': h, 'low': l, 'close': c, 'volume': vol or 0,
+                })
 
     return {
         'name': meta.get('symbol', symbol),
@@ -354,13 +380,38 @@ def get_quote_yahoo(code):
         'low': valid_low,
         'change_pct': change_pct,
         'currency': meta.get('currency', ''),
-        'session': session_label,       # 交易时段标签
-        'session_raw': session,         # 原始时段标识
-        'pre_market_price': pre_price,  # 盘前价（参考）
-        'post_market_price': post_price,# 盘后价（参考）
+        'session': session_label,
+        'session_raw': session,
+        'pre_market_price': pre_price,
+        'post_market_price': post_price,
         'week52_high': week52_high,
         'week52_low': week52_low,
+        'klines': klines,
     }
+
+
+def _get_latest_chart_price(timestamps, quotes, meta, target_session):
+    """从 chart 数据点中提取盘前/盘后的最新价格"""
+    closes = quotes.get('close') or []
+    if not timestamps or not closes:
+        return None
+
+    ctp = meta.get('currentTradingPeriod', {})
+    period = ctp.get(target_session, {})
+    if not period:
+        return None
+
+    start = period.get('start', 0)
+    end = period.get('end', 0)
+
+    # 从后往前找在目标时段内的最后一个有效价格
+    for i in range(len(timestamps) - 1, -1, -1):
+        ts = timestamps[i]
+        close = closes[i] if i < len(closes) else None
+        if close is not None and start <= ts <= end:
+            return close
+
+    return None
 
 
 def detect_market(code):
@@ -464,15 +515,15 @@ def get_quotes_tencent_batch(codes):
         else:
             normalized.append(code)
 
-    # 批量请求：逗号分隔
+    # 批量请求：逗号分隔，腾讯主站（超时3秒快速失败以便回退到其他源）
     codes_str = ','.join(normalized)
     url = f'https://qt.gtimg.cn/q={codes_str}'
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=3) as resp:
             content = resp.read().decode('gbk')
     except Exception as e:
-        print(f'[Tencent Batch] Request failed: {e}')
+        print(f'[Tencent Batch] failed: {e}')
         return {}
 
     # 解析返回的多条数据（每条以 v_ 开头，分号分隔）
@@ -557,6 +608,149 @@ def get_quotes_tencent_batch(codes):
     return results
 
 
+
+def get_quotes_sina_batch(codes):
+    """新浪接口批量获取A股/港股行情（第二数据源）
+    新浪需要 Referer 头，否则返回403。
+    返回格式: var hq_str_sh601398="名称,今开,昨收,当前价,最高,最低,...";
+    """
+    import urllib.request
+    import re as _re
+
+    # 新浪支持 A股(sh/sz) 和港股(hk)
+    sina_codes = []
+    for code in codes:
+        c = code.lower()
+        if c.startswith(('sh', 'sz', 'hk', 's_sh', 's_sz', 's_hk')):
+            sina_codes.append(code)
+    if not sina_codes:
+        return {}
+
+    codes_str = ','.join(sina_codes)
+    url = f'https://hq.sinajs.cn/list={codes_str}'
+    req = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0',
+        'Referer': 'https://finance.sina.com.cn'
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            text = resp.read().decode('gbk')
+    except Exception as e:
+        print(f'[Sina Batch] failed: {e}')
+        return {}
+
+    results = {}
+    for line in text.strip().split('\n'):
+        line = line.strip()
+        if '=' not in line:
+            continue
+        prefix, value = line.split('=', 1)
+        # hq_str_sh601398 → sh601398
+        code_part = prefix.replace('var hq_str_', '').strip()
+        if not code_part:
+            continue
+        m = _re.search(r'"([^"]*)"', value)
+        if not m:
+            continue
+        fields = m.group(1).split(',')
+        if len(fields) < 6:
+            continue
+        try:
+            name = fields[0]
+            open_price = float(fields[1]) if fields[1] else None
+            yest_close = float(fields[2]) if fields[2] else None
+            price = float(fields[3]) if fields[3] else None
+            high = float(fields[4]) if fields[4] else None
+            low = float(fields[5]) if fields[5] else None
+            change_pct = None
+            if price is not None and yest_close and yest_close > 0:
+                change_pct = ((price - yest_close) / yest_close) * 100
+            results[code_part] = {
+                'name': name,
+                'code': code_part,
+                'price': price,
+                'yest_close': yest_close,
+                'open': open_price,
+                'high': high,
+                'low': low,
+                'change_pct': change_pct,
+            }
+        except (ValueError, IndexError):
+            continue
+    return results
+
+
+def get_quotes_eastmoney_batch(codes):
+    """东方财富批量获取A股行情（第三数据源）
+    secid格式: 1.{code}(沪市) / 0.{code}(深市)
+    f2=最新价 f3=涨跌幅 f12=代码 f13=市场 f14=名称 f15=最高 f16=最低 f17=今开 f18=昨收
+    """
+    import urllib.request
+    import json as _json
+
+    secids = []
+    for code in codes:
+        c = code.lower()
+        if c.startswith('sh'):
+            secids.append(f'1.{c[2:]}')
+        elif c.startswith('sz'):
+            secids.append(f'0.{c[2:]}')
+        # 东方财富不处理美股/港股
+    if not secids:
+        return {}
+
+    secids_str = ','.join(secids)
+    # fltt=2 返回浮点价格；用 http 避免 https 握手被拒
+    url = (
+        f'http://push2.eastmoney.com/api/qt/ulist.np/get'
+        f'?fltt=2&fields=f2,f3,f12,f13,f14,f15,f16,f17,f18'
+        f'&secids={secids_str}'
+    )
+    req = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0',
+        'Referer': 'https://quote.eastmoney.com/'
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = _json.loads(resp.read().decode('utf-8'))
+    except Exception as e:
+        print(f'[EastMoney Batch] failed: {e}')
+        return {}
+
+    diff = data.get('data', {}).get('diff', [])
+    if not diff:
+        return {}
+
+    def _safe_float(val):
+        if val is None or val == '-' or val == '':
+            return None
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+
+    results = {}
+    for item in diff:
+        secid = str(item.get('f12', ''))
+        market = item.get('f13', 0)
+        prefix = 'sh' if market == 1 else 'sz'
+        orig_code = f'{prefix}{secid}'
+        price = _safe_float(item.get('f2'))
+        if price is None:
+            continue
+        results[orig_code] = {
+            'name': item.get('f14', orig_code),
+            'code': orig_code,
+            'price': price,
+            'yest_close': _safe_float(item.get('f18')),
+            'open': _safe_float(item.get('f17')),
+            'high': _safe_float(item.get('f15')),
+            'low': _safe_float(item.get('f16')),
+            'change_pct': _safe_float(item.get('f3')),
+        }
+    return results
+
+
 def get_quotes_batch(codes, source='auto', host=None):
     """统一批量行情获取接口
     按数据源分组，减少请求次数：
@@ -612,18 +806,31 @@ def get_quotes_batch(codes, source='auto', host=None):
 
     results = {}
 
-    # A股：TDX 逐个（低延迟但非线程安全）+ 腾讯批量补充名称
+    # A股：三源轮询（腾讯/新浪/东方财富），避免单一接口限流
     if a_share_codes:
-        # 先用腾讯批量获取（一次请求，包含名称）
-        tencent_results = get_quotes_tencent_batch(a_share_codes)
-        results.update(tencent_results)
-        # 对没有获取到的，尝试 TDX
-        for code in a_share_codes:
-            if code not in tencent_results:
-                try:
-                    results[code] = get_quote_tdx(code, host)
-                except Exception:
-                    pass
+        a_sources = ['tencent', 'sina', 'eastmoney']
+        idx = getattr(get_quotes_batch, '_a_share_idx', 0)
+        cur_source = a_sources[idx % len(a_sources)]
+        get_quotes_batch._a_share_idx = (idx + 1) % len(a_sources)
+
+        batch_results = {}
+        if cur_source == 'tencent':
+            batch_results = get_quotes_tencent_batch(a_share_codes)
+        elif cur_source == 'sina':
+            batch_results = get_quotes_sina_batch(a_share_codes)
+        elif cur_source == 'eastmoney':
+            batch_results = get_quotes_eastmoney_batch(a_share_codes)
+
+        # 当前源获取不全的，用腾讯补充
+        missing = [c for c in a_share_codes
+                   if c not in batch_results or batch_results[c].get('price') is None]
+        if missing:
+            tencent_fill = get_quotes_tencent_batch(missing)
+            for c in missing:
+                if c in tencent_fill and tencent_fill[c].get('price') is not None:
+                    batch_results[c] = tencent_fill[c]
+
+        results.update(batch_results)
 
     # 港股：腾讯批量
     if hk_codes:
@@ -631,15 +838,20 @@ def get_quotes_batch(codes, source='auto', host=None):
 
     # 美股：先检测交易时段（Yahoo），常规时段用腾讯批量
     if us_codes:
-        # 先用腾讯批量获取（一次请求）
+        # 腾讯批量获取（一次请求，快）
         tencent_us = get_quotes_tencent_batch(us_codes)
-        # 再用 Yahoo 并发检测交易时段和补充盘前盘后数据
+        # Yahoo 并发获取（检测交易时段 + 盘前盘后数据）
         yahoo_us = {}
-        for code in us_codes:
+        from concurrent.futures import ThreadPoolExecutor
+        def _fetch_yahoo(code):
             try:
-                yahoo_us[code] = get_quote_yahoo(code)
+                return code, get_quote_yahoo(code)
             except Exception:
-                pass
+                return code, None
+        with ThreadPoolExecutor(max_workers=min(8, len(us_codes))) as ex:
+            for code, q in ex.map(_fetch_yahoo, us_codes):
+                if q is not None:
+                    yahoo_us[code] = q
         # 合并：Yahoo 优先（有交易时段信息），腾讯补充
         for code in us_codes:
             yq = yahoo_us.get(code)
@@ -661,19 +873,149 @@ def get_quotes_batch(codes, source='auto', host=None):
             elif tq and tq.get('price') is not None:
                 results[code] = tq
 
-    # 韩股/其他：Yahoo
+    # 韩股/其他：Yahoo 并发
     if kr_codes:
-        for code in kr_codes:
+        from concurrent.futures import ThreadPoolExecutor
+        def _fetch_yahoo_kr(code):
             try:
-                results[code] = get_quote_yahoo(code)
+                return code, get_quote_yahoo(code)
             except Exception:
-                pass
+                return code, None
+        with ThreadPoolExecutor(max_workers=min(8, len(kr_codes))) as ex:
+            for code, q in ex.map(_fetch_yahoo_kr, kr_codes):
+                if q is not None:
+                    results[code] = q
 
     # 其他：腾讯批量
     if other_codes:
         results.update(get_quotes_tencent_batch(other_codes))
 
     return results
+
+
+def get_kline_1min(code, count=60):
+    """获取1分钟K线数据
+    A股: 东方财富接口
+    美股/韩股: Yahoo Finance
+    返回: [{'time': 'HH:MM', 'open': x, 'high': x, 'low': x, 'close': x, 'volume': x}, ...]
+    """
+    market = detect_market(code)
+    if market == 'a_share':
+        return _get_kline_eastmoney(code, count)
+    elif market in ('us', 'kr', 'yahoo', 'hk'):
+        return _get_kline_yahoo(code, count)
+    return []
+
+
+def _get_kline_eastmoney(code, count=60):
+    """东方财富1分钟K线 (A股)
+    klt=1 表示1分钟, fqt=1 前复权
+    """
+    import urllib.request
+    import json as _json
+
+    c = code.lower()
+    if c.startswith('sh'):
+        secid = f'1.{c[2:]}'
+    elif c.startswith('sz'):
+        secid = f'0.{c[2:]}'
+    else:
+        return []
+
+    url = (
+        f'http://push2his.eastmoney.com/api/qt/stock/kline/get'
+        f'?secid={secid}&klt=1&fqt=1&end=20500101&lmt={count}'
+        f'&fields1=f1,f2,f3,f5,f6'
+        f'&fields2=f51,f52,f53,f54,f55,f56'
+    )
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = _json.loads(resp.read().decode('utf-8'))
+    except Exception as e:
+        print(f'[KLine EastMoney] failed: {e}')
+        return []
+
+    klines = data.get('data', {}).get('klines', [])
+    if not klines:
+        return []
+
+    result = []
+    for line in klines:
+        parts = line.split(',')
+        if len(parts) < 6:
+            continue
+        try:
+            # f51=时间, f52=开, f53=收, f54=高, f55=低, f56=量
+            time_str = parts[0].split(' ')[-1] if ' ' in parts[0] else parts[0]
+            result.append({
+                'time': time_str,
+                'open': float(parts[1]),
+                'close': float(parts[2]),
+                'high': float(parts[3]),
+                'low': float(parts[4]),
+                'volume': float(parts[5]),
+            })
+        except (ValueError, IndexError):
+            continue
+    return result
+
+
+def _get_kline_yahoo(code, count=60):
+    """Yahoo Finance 1分钟K线 (美股/韩股)
+    range=1h 约60根1分钟K线
+    """
+    import urllib.request
+    import json as _json
+    import time as _time
+
+    symbol = code
+    if code.lower().startswith('kr'):
+        num = code[2:]
+        symbol = f'{num}.KS' if num.startswith('0') and len(num) == 6 else f'{num}.KQ'
+
+    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1h'
+    req = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = _json.loads(resp.read().decode('utf-8'))
+    except Exception as e:
+        print(f'[KLine Yahoo] failed: {e}')
+        return []
+
+    result_obj = data.get('chart', {}).get('result')
+    if not result_obj:
+        return []
+
+    timestamps = result_obj[0].get('timestamp', [])
+    indicators = result_obj[0].get('indicators', {})
+    quotes = indicators.get('quote', [{}])[0]
+
+    opens = quotes.get('open', [])
+    highs = quotes.get('high', [])
+    lows = quotes.get('low', [])
+    closes = quotes.get('close', [])
+    volumes = quotes.get('volume', [])
+
+    result = []
+    for i in range(min(len(timestamps), count)):
+        o = opens[i] if i < len(opens) else None
+        h = highs[i] if i < len(highs) else None
+        l = lows[i] if i < len(lows) else None
+        c = closes[i] if i < len(closes) else None
+        v = volumes[i] if i < len(volumes) else 0
+        if o is None or c is None or h is None or l is None:
+            continue
+        time_str = _time.strftime('%H:%M', _time.localtime(timestamps[i]))
+        result.append({
+            'time': time_str,
+            'open': o, 'high': h, 'low': l, 'close': c,
+            'volume': v or 0,
+        })
+    return result
+
 
 def check_single(code, name, target, direction, interval, log_file,
                  source='tdx', host=None, notify='popup'):

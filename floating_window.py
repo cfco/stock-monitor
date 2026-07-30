@@ -14,12 +14,12 @@ import datetime
 import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'scripts'))
-from price_alert import get_quote, detect_market, close_tdx_client, get_quotes_batch
+from price_alert import get_quote, detect_market, close_tdx_client, get_quotes_batch, get_kline_1min
 
 from PySide6.QtCore import Qt, QThread, Signal, QPoint, QRect, QTimer, QSize
 from PySide6.QtGui import (
     QFont, QColor, QPalette, QIcon, QPainter, QBrush, QPen,
-    QMouseEvent, QPaintEvent, QAction, QIntValidator, QDoubleValidator
+    QMouseEvent, QPaintEvent, QAction, QIntValidator, QDoubleValidator, QCursor
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
@@ -94,6 +94,8 @@ class QuoteWorker(QThread):
         self.running = False
         self._lock = threading.Lock()
         self.alert_cooldown = {}
+        self.kline_cache = {}       # {code: (timestamp, klines)}
+        self._kline_fetching = False
 
     def update_config(self, config):
         with self._lock:
@@ -118,6 +120,7 @@ class QuoteWorker(QThread):
             now_str = datetime.datetime.now().strftime('%H:%M:%S')
 
             # 批量获取行情（按数据源分组，减少请求次数）
+            fetch_start = time.time()
             valid_codes = [item.get('code', '') for item in alerts if item.get('code')]
             results = get_quotes_batch(valid_codes, source)
 
@@ -143,6 +146,11 @@ class QuoteWorker(QThread):
 
                 loop_success = True
 
+                # Yahoo returns klines in chart data, cache them directly
+                klines = q.get('klines', [])
+                if klines:
+                    self.kline_cache[code] = (time.time(), klines)
+
                 payload = {
                     'name': name,
                     'code': code,
@@ -159,6 +167,7 @@ class QuoteWorker(QThread):
                     'currency': q.get('currency', ''),
                     'session': q.get('session', ''),
                     'last_update': now_str,
+                    'klines': klines,
                 }
                 self.quote_updated.emit(payload)
 
@@ -209,16 +218,52 @@ class QuoteWorker(QThread):
                     consecutive_errors = 0
 
             self.batch_done.emit(now_str)
+
+            # A-share kline async prefetch (every 30s, non-blocking)
+            if not self._kline_fetching:
+                self._kline_fetching = True
+                a_codes = [item.get('code', '') for item in alerts
+                           if item.get('code') and detect_market(item['code']) == 'a_share']
+                codes_to_fetch = []
+                now_ts = time.time()
+                for c in a_codes:
+                    last_ts = self.kline_cache.get(c, (0, []))[0]
+                    if now_ts - last_ts > 30:
+                        codes_to_fetch.append(c)
+                if codes_to_fetch:
+                    t = threading.Thread(target=self._fetch_a_share_klines, args=(codes_to_fetch,), daemon=True)
+                    t.start()
+                else:
+                    self._kline_fetching = False
+
+            # 等待下一轮（减去本轮获取耗时，保证实际刷新频率）
+            fetch_duration = max(0, time.time() - fetch_start)
+            sleep_time = max(0.5, interval - fetch_duration)
             slept = 0
-            while slept < interval and self.running:
-                time.sleep(0.2)
-                slept += 0.2
+            while slept < sleep_time and self.running:
+                time.sleep(0.1)
+                slept += 0.1
 
         self.status_changed.emit('stopped')
         try:
             close_tdx_client()
         except Exception:
             pass
+
+    def _fetch_a_share_klines(self, codes):
+        """后台线程: 获取A股1分钟K线并缓存"""
+        try:
+            for code in codes:
+                if not self.running:
+                    break
+                try:
+                    klines = get_kline_1min(code, 60)
+                    if klines:
+                        self.kline_cache[code] = (time.time(), klines)
+                except Exception as e:
+                    print(f'[Kline Prefetch] {code} failed: {e}')
+        finally:
+            self._kline_fetching = False
 
     def _check_alert(self, name, code, price, target, direction):
         if direction in ('below', 'both') and price <= target:
@@ -244,6 +289,131 @@ class QuoteWorker(QThread):
                 direction = '跌' if change_pct < 0 else '涨'
                 return True, f'{name} {direction}幅达 {change_pct:+.2f}% 超过 {abs_target}%'
         return False, ''
+
+
+
+# ============================================================
+# K线悬浮图（鼠标悬停显示1分钟K线）
+# ============================================================
+class KlineTooltip(QWidget):
+    """K线悬浮图窗口（无边框、置顶、鼠标穿透）"""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setFixedSize(320, 180)
+
+        self.code = ''
+        self.name = ''
+        self.klines = []
+
+    def set_data(self, code, name, klines):
+        self.code = code
+        self.name = name
+        self.klines = klines
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        # 背景
+        bg_color = QColor(COLOR_BG)
+        bg_color.setAlpha(245)
+        p.setBrush(QBrush(bg_color))
+        p.setPen(QPen(QColor(COLOR_BORDER), 1))
+        p.drawRoundedRect(0, 0, self.width(), self.height(), 8, 8)
+
+        if not self.klines:
+            p.setPen(QColor(COLOR_TEXT_DIM))
+            p.setFont(QFont('Microsoft YaHei UI', 9))
+            p.drawText(self.rect(), Qt.AlignCenter, '暂无K线数据')
+            p.end()
+            return
+
+        # 标题: 名称 + 最新价
+        last = self.klines[-1]
+        first = self.klines[0]
+        p.setPen(QColor(COLOR_TEXT))
+        p.setFont(QFont('Microsoft YaHei UI', 9, QFont.Bold))
+        title = f'{self.name}  {last["close"]:.2f}'
+        p.drawText(10, 16, title)
+
+        # 涨跌幅
+        if first['close'] > 0:
+            pct = ((last['close'] - first['open']) / first['open']) * 100
+        else:
+            pct = 0
+        pct_color = QColor(COLOR_UP) if pct >= 0 else QColor(COLOR_DOWN)
+        pct_str = f'{pct:+.2f}%'
+        p.setPen(pct_color)
+        fm = p.fontMetrics()
+        title_w = fm.horizontalAdvance(title)
+        p.drawText(10 + title_w + 8, 16, pct_str)
+
+        # K线绘制区域
+        x0, y0 = 10, 26
+        w = self.width() - 20
+        h = self.height() - 42
+
+        n = len(self.klines)
+        bar_w = max(2, (w - n) // n)
+        gap = 1
+        step = bar_w + gap
+
+        # 价格范围
+        max_price = max(k['high'] for k in self.klines)
+        min_price = min(k['low'] for k in self.klines)
+        price_range = max_price - min_price
+        if price_range == 0:
+            price_range = max(0.01, abs(max_price) * 0.001)
+
+        def price_to_y(price):
+            return y0 + h - (price - min_price) / price_range * h
+
+        # 画K线
+        for i, k in enumerate(self.klines):
+            x = x0 + i * step
+            open_y = price_to_y(k['open'])
+            close_y = price_to_y(k['close'])
+            high_y = price_to_y(k['high'])
+            low_y = price_to_y(k['low'])
+
+            if k['close'] >= k['open']:
+                color = QColor(COLOR_UP)   # 红涨
+            else:
+                color = QColor(COLOR_DOWN)  # 绿跌
+
+            p.setPen(QPen(color, 1))
+            # 影线
+            cx = x + bar_w // 2
+            p.drawLine(cx, int(high_y), cx, int(low_y))
+            # 实体
+            body_top = int(min(open_y, close_y))
+            body_h = max(1, int(abs(close_y - open_y)))
+            p.setBrush(QBrush(color))
+            p.drawRect(x, body_top, bar_w, body_h)
+
+        # 价格标注
+        p.setPen(QColor(COLOR_TEXT_DIM))
+        p.setFont(QFont('Microsoft YaHei UI', 7))
+        p.drawText(x0 + 2, y0 + 8, f'{max_price:.2f}')
+        p.drawText(x0 + 2, y0 + h, f'{min_price:.2f}')
+
+        # 时间标注
+        if n > 0:
+            p.drawText(x0, self.height() - 6, self.klines[0]['time'])
+            last_time = self.klines[-1]['time']
+            tw = p.fontMetrics().horizontalAdvance(last_time)
+            p.drawText(self.width() - 10 - tw, self.height() - 6, last_time)
+
+        p.end()
 
 
 # ============================================================
@@ -325,6 +495,32 @@ class QuoteCard(QFrame):
 
         self._apply_default_style()
 
+        # K线悬浮图: hover防抖定时器（用QTimer实例，便于stop）
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.timeout.connect(self._request_kline)
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WA_Hover, True)
+
+    def enterEvent(self, event):
+        """鼠标进入卡片: 300ms防抖后请求K线"""
+        self._hover_timer.start(300)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        """鼠标离开卡片: 取消请求并隐藏K线图"""
+        self._hover_timer.stop()
+        win = self.window()
+        if hasattr(win, 'hide_kline_tooltip'):
+            win.hide_kline_tooltip()
+        super().leaveEvent(event)
+
+    def _request_kline(self):
+        """请求该股票的1分钟K线"""
+        win = self.window()
+        if hasattr(win, 'show_kline_for_card'):
+            win.show_kline_for_card(self.code, self.name, QCursor.pos())
+
     def _update_name_elided(self):
         """截断长名称显示，鼠标悬停显示完整"""
         from PySide6.QtGui import QFontMetrics
@@ -386,7 +582,13 @@ class QuoteCard(QFrame):
             currency_symbol = '¥'
 
         if price is not None:
-            self.price_label.setText(f'{currency_symbol}{price:,.2f}')
+            # ETF（510开头）和部分基金需要3位小数，其他股票2位
+            code = self.code.lower()
+            if code.startswith(('sh51', 'sz15', 'sz16', 'sh50', 'sh58')):
+                # ETF/基金：3位小数
+                self.price_label.setText(f'{currency_symbol}{price:,.3f}')
+            else:
+                self.price_label.setText(f'{currency_symbol}{price:,.2f}')
         else:
             self.price_label.setText('--')
 
@@ -779,6 +981,8 @@ class FloatingWindow(QWidget):
         self.worker = None
         self.start_time = None
         self._drag_offset = None
+        self._kline_tooltip = None
+        self._kline_fetcher = None
 
         self._init_window()
         self._init_ui()
@@ -798,6 +1002,7 @@ class FloatingWindow(QWidget):
         self.setMaximumWidth(320)
 
     def _init_ui(self):
+        self.setStyleSheet(f'FloatingWindow {{ background: transparent; }}')
         outer = QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(0)
@@ -828,19 +1033,28 @@ class FloatingWindow(QWidget):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 显式移除 corner widget，彻底清除水平滚动条占用的空间
+        self.scroll.setCornerWidget(None)
         self.scroll.setStyleSheet(
             f'QScrollArea {{ background: transparent; border: none; }}'
-            f'QScrollBar:vertical {{ background: {COLOR_BG}; width: 5px; }}'
-            f'QScrollBar::handle:vertical {{ background: {COLOR_BORDER}; border-radius: 2px; }}'
-            f'QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}'
+            f'QScrollBar:vertical {{ background: {COLOR_BG_LIGHT}; width: 6px; margin: 0; }}'
+            f'QScrollBar::handle:vertical {{ background: {COLOR_BORDER}; border-radius: 3px; min-height: 20px; }}'
+            f'QScrollBar::handle:vertical:hover {{ background: {COLOR_TEXT_DIM}; }}'
+            f'QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; background: transparent; }}'
+            f'QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}'
+            # 水平滚动条：高度设为0，彻底不占空间
+            f'QScrollBar:horizontal {{ height: 0; width: 0; background: transparent; }}'
+            f'QScrollBar::handle:horizontal {{ background: transparent; }}'
+            f'QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ height: 0; width: 0; }}'
         )
-        self.scroll.setMinimumHeight(80)
 
         self.list_widget = QWidget()
+        self.list_widget.setStyleSheet(f'QWidget {{ background: {COLOR_BG}; }}')
         self.list_layout = QVBoxLayout(self.list_widget)
         self.list_layout.setContentsMargins(2, 2, 2, 2)
         self.list_layout.setSpacing(1)
-        self.list_layout.addStretch()
+        self.list_layout.addStretch(0)
         self.scroll.setWidget(self.list_widget)
         container_layout.addWidget(self.scroll, 1)
 
@@ -875,14 +1089,7 @@ class FloatingWindow(QWidget):
 
         h.addStretch()
 
-        # 右侧：重载 + 设置
-        self.btn_reload = QPushButton('↻')
-        self.btn_reload.setCursor(Qt.PointingHandCursor)
-        self.btn_reload.setFixedSize(24, 20)
-        self.btn_reload.setStyleSheet(self._btn_style(COLOR_BORDER))
-        self.btn_reload.clicked.connect(self.reload_config)
-        h.addWidget(self.btn_reload)
-
+        # 右侧：设置（保存时自动刷新配置）
         self.btn_settings = QPushButton('⚙')
         self.btn_settings.setCursor(Qt.PointingHandCursor)
         self.btn_settings.setFixedSize(24, 20)
@@ -895,14 +1102,6 @@ class FloatingWindow(QWidget):
         h.addWidget(self.btn_settings)
 
         parent_layout.addWidget(bar)
-
-    def _btn_style(self, color):
-        return (
-            f'QPushButton {{ background: {color}; color: white; border: none;'
-            f'  border-radius: 4px; font-size: 10px; font-weight: 700; }}'
-            f'QPushButton:hover {{ opacity: 0.85; }}'
-            f'QPushButton:disabled {{ background: #555; color: #888; }}'
-        )
 
     def _init_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -1008,9 +1207,27 @@ class FloatingWindow(QWidget):
             self.cards[code] = card
 
         n = len(self.cards)
-        base_h = 32  # 底部栏
-        list_h = min(n * 26 + 8, 500)
-        self.resize(280, base_h + list_h)
+        # 精确计算高度：每张卡片24px + 间距1px + 边距4px
+        # 最多显示10条，超过则需要滚动
+        MAX_VISIBLE = 10
+        CARD_H = 24
+        CARD_SPACING = 1
+        LIST_MARGIN_H = 4   # 列表上下边距
+        BOTTOM_BAR_H = 32   # 底部按钮栏
+        OUTER_MARGIN_H = 12  # 外框上下边距
+        CONTAINER_BORDER_H = 2  # 容器1px边框上下
+        BUFFER_H = 4  # 补偿DPI和渲染误差
+
+        visible_n = min(n, MAX_VISIBLE)
+        if visible_n > 0:
+            list_content_h = visible_n * CARD_H + max(0, visible_n - 1) * CARD_SPACING + LIST_MARGIN_H
+        else:
+            list_content_h = 0
+        total_h = OUTER_MARGIN_H + CONTAINER_BORDER_H + list_content_h + BOTTOM_BAR_H + BUFFER_H
+
+        self.resize(280, total_h)
+        # 重置滚动区域最小高度
+        self.scroll.setMinimumHeight(0)
 
     def start_monitor(self):
         if self.worker and self.worker.isRunning():
@@ -1038,16 +1255,6 @@ class FloatingWindow(QWidget):
             self._uptime_timer.stop()
         self.status_dot.setStyleSheet(f'color: {COLOR_FLAT}; font-size: 9px;')
 
-    def reload_config(self):
-        was_running = self.worker and self.worker.isRunning()
-        if was_running:
-            self.worker.stop()
-            self.worker.wait(2000)
-        self.config = load_config()
-        self._rebuild_cards()
-        if was_running:
-            self.start_monitor()
-
     def _open_settings(self):
         dlg = SettingsDialog(self.config, self)
         dlg.config_changed.connect(self._on_config_changed)
@@ -1062,6 +1269,49 @@ class FloatingWindow(QWidget):
         self._rebuild_cards()
         if was_running:
             self.start_monitor()
+
+    def show_kline_for_card(self, code, name, mouse_pos):
+        """Show kline tooltip instantly from cache (zero latency)"""
+        klines = []
+        if self.worker and hasattr(self.worker, 'kline_cache'):
+            cached = self.worker.kline_cache.get(code)
+            if cached:
+                klines = cached[1]
+        if klines:
+            self._show_kline_tooltip(code, name, klines, mouse_pos)
+
+    def _show_kline_tooltip(self, code, name, klines, mouse_pos):
+        """显示K线悬浮图, 智能定位"""
+        if self._kline_tooltip is None:
+            self._kline_tooltip = KlineTooltip()
+
+        self._kline_tooltip.set_data(code, name, klines)
+
+        screen = QApplication.primaryScreen().availableGeometry()
+        tip_w = self._kline_tooltip.width()
+        tip_h = self._kline_tooltip.height()
+
+        # 默认: 鼠标右下方
+        x = mouse_pos.x() + 15
+        y = mouse_pos.y() + 15
+        # 右侧不够 → 左侧
+        if x + tip_w > screen.right():
+            x = mouse_pos.x() - tip_w - 15
+        # 下方不够 → 上方
+        if y + tip_h > screen.bottom():
+            y = mouse_pos.y() - tip_h - 15
+        # 确保不超出屏幕
+        x = max(screen.left(), min(x, screen.right() - tip_w))
+        y = max(screen.top(), min(y, screen.bottom() - tip_h))
+
+        self._kline_tooltip.move(x, y)
+        self._kline_tooltip.show()
+        self._kline_tooltip.raise_()
+
+    def hide_kline_tooltip(self):
+        """隐藏K线悬浮图"""
+        if self._kline_tooltip:
+            self._kline_tooltip.hide()
 
     def on_quote(self, data):
         code = data.get('code')
