@@ -24,7 +24,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
     QPushButton, QFrame, QGraphicsDropShadowEffect, QScrollArea,
-    QSystemTrayIcon, QMenu, QMessageBox, QSizePolicy,
+    QMessageBox, QSizePolicy,
     QDialog, QLineEdit, QComboBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QFormLayout, QGroupBox, QSpinBox
 )
@@ -295,10 +295,17 @@ class QuoteWorker(QThread):
 # ============================================================
 # K线悬浮图（鼠标悬停显示1分钟K线）
 # ============================================================
+KLINE_SIZES = {
+    'small':  (320, 180),   # 小（默认）
+    'medium': (640, 360),   # 中（长宽各×2）
+    'large':  (960, 540),   # 大（长宽各×3）
+}
+
+
 class KlineTooltip(QWidget):
     """K线悬浮图窗口（无边框、置顶、鼠标穿透）"""
 
-    def __init__(self):
+    def __init__(self, size_key='small'):
         super().__init__()
         self.setWindowFlags(
             Qt.FramelessWindowHint
@@ -307,7 +314,8 @@ class KlineTooltip(QWidget):
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.setFixedSize(320, 180)
+        w, h = KLINE_SIZES.get(size_key, KLINE_SIZES['small'])
+        self.setFixedSize(w, h)
 
         self.code = ''
         self.name = ''
@@ -318,6 +326,14 @@ class KlineTooltip(QWidget):
         self.name = name
         self.klines = klines
         self.update()
+
+    @property
+    def size_key(self):
+        w, h = self.width(), self.height()
+        for key, (sw, sh) in KLINE_SIZES.items():
+            if w == sw and h == sh:
+                return key
+        return 'small' 
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -445,7 +461,6 @@ class QuoteCard(QFrame):
         self.name_label = QLabel(name)
         self.name_label.setFixedWidth(70)
         self.name_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.name_label.setToolTip(name)
         self.name_label.setStyleSheet(
             f'color: {COLOR_TEXT}; font-size: 10px; font-weight: 600;'
         )
@@ -522,12 +537,11 @@ class QuoteCard(QFrame):
             win.show_kline_for_card(self.code, self.name, QCursor.pos())
 
     def _update_name_elided(self):
-        """截断长名称显示，鼠标悬停显示完整"""
+        """截断长名称显示"""
         from PySide6.QtGui import QFontMetrics
         fm = QFontMetrics(self.name_label.font())
         elided = fm.elidedText(self.name, Qt.ElideRight, self.name_label.width() - 4)
         self.name_label.setText(elided)
-        self.name_label.setToolTip(self.name)
 
     def _apply_default_style(self):
         self._triggered = False
@@ -567,7 +581,6 @@ class QuoteCard(QFrame):
         # 更新名称（如有变化）
         if name != self.name:
             self.name = name
-            self.name_label.setToolTip(name)
             self._update_name_elided()
 
         # 货币符号
@@ -740,6 +753,11 @@ class SettingsDialog(QDialog):
         self.interval_spin.setValue(self.config.get('interval', 5))
         self.interval_spin.setSuffix(' 秒')
         top_form.addRow('刷新间隔:', self.interval_spin)
+
+        self.kline_size_combo = QComboBox()
+        self.kline_size_combo.addItems(['small', 'medium', 'large'])
+        self.kline_size_combo.setCurrentText(self.config.get('kline_size', 'small'))
+        top_form.addRow('K线图大小:', self.kline_size_combo)
 
         self.source_combo = QComboBox()
         self.source_combo.addItems(['auto', 'tencent', 'yahoo', 'tdx'])
@@ -960,6 +978,7 @@ class SettingsDialog(QDialog):
             })
 
         self.config['interval'] = self.interval_spin.value()
+        self.config['kline_size'] = self.kline_size_combo.currentText()
         self.config['source'] = self.source_combo.currentText()
         self.config['alerts'] = alerts
 
@@ -986,7 +1005,6 @@ class FloatingWindow(QWidget):
 
         self._init_window()
         self._init_ui()
-        self._init_tray()
         self._move_to_bottom_right()
 
         QTimer.singleShot(300, self.start_monitor)
@@ -1102,52 +1120,6 @@ class FloatingWindow(QWidget):
         h.addWidget(self.btn_settings)
 
         parent_layout.addWidget(bar)
-
-    def _init_tray(self):
-        if not QSystemTrayIcon.isSystemTrayAvailable():
-            return
-        self.tray = QSystemTrayIcon(self)
-        pix = self._make_tray_icon()
-        self.tray.setIcon(QIcon(pix))
-        self.tray.setToolTip(f'Stock Monitor v{VERSION}')
-
-        menu = QMenu()
-        act_show = QAction('显示悬浮窗', self)
-        act_show.triggered.connect(self.show_normal)
-        act_quit = QAction('退出', self)
-        act_quit.triggered.connect(QApplication.quit)
-        menu.addAction(act_show)
-        menu.addSeparator()
-        menu.addAction(act_quit)
-
-        self.tray.setContextMenu(menu)
-        self.tray.activated.connect(self._on_tray_activated)
-        self.tray.show()
-
-    def _make_tray_icon(self):
-        from PySide6.QtGui import QPixmap
-        pix = QPixmap(16, 16)
-        pix.fill(Qt.transparent)
-        p = QPainter(pix)
-        p.setRenderHint(QPainter.Antialiasing)
-        p.setBrush(QBrush(QColor(COLOR_DOWN)))
-        p.setPen(Qt.NoPen)
-        p.drawRoundedRect(0, 0, 16, 16, 4, 4)
-        p.setPen(QPen(QColor('white')))
-        p.setFont(QFont('Segoe UI', 8, QFont.Bold))
-        p.drawText(pix.rect(), Qt.AlignCenter, 'S')
-        p.end()
-        return pix
-
-    def _on_tray_activated(self, reason):
-        if reason == QSystemTrayIcon.DoubleClick:
-            self.show_normal()
-
-    def show_normal(self):
-        self.show()
-        self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
-        self.raise_()
-        self.activateWindow()
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton:
@@ -1282,8 +1254,13 @@ class FloatingWindow(QWidget):
 
     def _show_kline_tooltip(self, code, name, klines, mouse_pos):
         """显示K线悬浮图, 智能定位"""
+        size_key = self.config.get('kline_size', 'small')
         if self._kline_tooltip is None:
-            self._kline_tooltip = KlineTooltip()
+            self._kline_tooltip = KlineTooltip(size_key)
+        elif self._kline_tooltip.size_key != size_key if hasattr(self._kline_tooltip, 'size_key') else True:
+            # 尺寸变更时重建
+            self._kline_tooltip.close()
+            self._kline_tooltip = KlineTooltip(size_key)
 
         self._kline_tooltip.set_data(code, name, klines)
 
@@ -1320,12 +1297,7 @@ class FloatingWindow(QWidget):
             card.set_data(data)
 
     def on_alert(self, data):
-        msg = data.get('message', '')
-        if hasattr(self, 'tray') and self.tray.isVisible():
-            self.tray.showMessage(
-                '价格预警', msg,
-                QSystemTrayIcon.Warning, 5000
-            )
+        pass  # 预警仅触发卡片变色，不再弹通知
 
     def on_status(self, status):
         if status == 'running':
@@ -1360,12 +1332,6 @@ class FloatingWindow(QWidget):
             pass
         event.accept()
 
-    def hideEvent(self, event):
-        if hasattr(self, 'tray') and self.tray.isVisible():
-            event.ignore()
-            self.hide()
-        else:
-            event.accept()
 
 
 # ============================================================

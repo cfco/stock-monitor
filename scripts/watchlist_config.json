@@ -79,8 +79,19 @@
       "pct_dir": "both",
       "position": "",
       "note": ""
+    },
+    {
+      "code": "sz000988",
+      "name": "华工科技",
+      "target": null,
+      "dir": "below",
+      "target_pct": null,
+      "pct_dir": "both",
+      "position": "",
+      "note": ""
     }
   ],
-  "interval": 5,
-  "source": "auto"
+  "interval": 2,
+  "source": "auto",
+  "kline_size": "large"
 }
