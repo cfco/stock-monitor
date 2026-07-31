@@ -132,6 +132,22 @@ def save_config(config):
         return False
 
 
+def is_a_share_trading_time(now=None):
+    """判断当前是否在A股交易时间段
+    交易时段：09:10-11:30, 13:00-15:00（周末不交易）
+    """
+    now = now or datetime.datetime.now()
+    if now.weekday() >= 5:  # 周六、周日
+        return False
+    minutes = now.hour * 60 + now.minute
+    # 9:10=550, 11:30=690, 13:00=780, 15:00=900
+    if 550 <= minutes <= 690:
+        return True
+    if 780 <= minutes <= 900:
+        return True
+    return False
+
+
 # ============================================================
 # 后台数据拉取线程
 # ============================================================
@@ -147,8 +163,10 @@ class QuoteWorker(QThread):
         self.running = False
         self._lock = threading.Lock()
         self.alert_cooldown = {}
-        self.kline_cache = {}       # {code: (timestamp, klines)}
+        self.kline_cache = {}       # {code: (timestamp, klines)} 1分钟; {code_daily/weekly: ...} 日K/周K
         self._kline_fetching = False
+        self._kline_period_fetching = False
+        self._first_loop = True     # 首次循环标记（启动时无论是否交易时间都请求一次，避免空白）
 
     def update_config(self, config):
         with self._lock:
@@ -171,11 +189,28 @@ class QuoteWorker(QThread):
             alerts = config.get('alerts', [])
             loop_success = False
             now_str = datetime.datetime.now().strftime('%H:%M:%S')
+            is_first_loop = self._first_loop
 
             # 批量获取行情（按数据源分组，减少请求次数）
             fetch_start = time.time()
             valid_codes = [item.get('code', '') for item in alerts if item.get('code')]
-            results = get_quotes_batch(valid_codes, source)
+
+            # A股交易时间外不刷新行情（首次启动除外，避免空白）
+            # 非A股代码（美股/港股/韩股）不受此限制
+            a_codes_in_list = [c for c in valid_codes if detect_market(c) == 'a_share']
+            non_a_codes = [c for c in valid_codes if detect_market(c) != 'a_share']
+            if non_a_codes:
+                should_fetch = True
+            elif a_codes_in_list:
+                should_fetch = is_first_loop or is_a_share_trading_time()
+            else:
+                should_fetch = False
+
+            if should_fetch:
+                results = get_quotes_batch(valid_codes, source)
+            else:
+                results = {}
+            self._first_loop = False
 
             # 串行处理结果
             for item in alerts:
@@ -273,7 +308,8 @@ class QuoteWorker(QThread):
             self.batch_done.emit(now_str)
 
             # A-share kline async prefetch (every 30s, non-blocking)
-            if not self._kline_fetching:
+            # 非交易时间跳过1分钟K线刷新（首次启动除外，避免空白）
+            if not self._kline_fetching and (is_first_loop or is_a_share_trading_time()):
                 self._kline_fetching = True
                 a_codes = [item.get('code', '') for item in alerts
                            if item.get('code') and detect_market(item['code']) == 'a_share']
@@ -288,6 +324,24 @@ class QuoteWorker(QThread):
                     t.start()
                 else:
                     self._kline_fetching = False
+
+            # 日K/周K 异步预加载（启动时请求一次，之后每小时刷新一次）
+            # 非交易时间跳过刷新（首次启动除外，避免空白）
+            if not self._kline_period_fetching and (is_first_loop or is_a_share_trading_time()):
+                period_pairs = []
+                now_ts = time.time()
+                # 所有市场都支持日K/周K（A股走东方财富，美股/韩股/港股走Yahoo）
+                all_codes = [item.get('code', '') for item in alerts if item.get('code')]
+                for c in all_codes:
+                    for period in ('daily', 'weekly'):
+                        cache_key = f'{c}_{period}'
+                        last_ts = self.kline_cache.get(cache_key, (0, []))[0]
+                        if now_ts - last_ts > 3600:  # 1小时
+                            period_pairs.append((c, period))
+                if period_pairs:
+                    self._kline_period_fetching = True
+                    t = threading.Thread(target=self._fetch_kline_period, args=(period_pairs,), daemon=True)
+                    t.start()
 
             # 等待下一轮（减去本轮获取耗时，保证实际刷新频率）
             fetch_duration = max(0, time.time() - fetch_start)
@@ -317,6 +371,23 @@ class QuoteWorker(QThread):
                     print(f'[Kline Prefetch] {code} failed: {e}')
         finally:
             self._kline_fetching = False
+
+    def _fetch_kline_period(self, code_period_pairs):
+        """后台线程: 获取日K/周K并缓存（启动时+每小时刷新）"""
+        try:
+            from price_alert import get_kline
+            for code, period in code_period_pairs:
+                if not self.running:
+                    break
+                try:
+                    klines = get_kline(code, period, 60)
+                    if klines:
+                        cache_key = f'{code}_{period}'
+                        self.kline_cache[cache_key] = (time.time(), klines)
+                except Exception as e:
+                    print(f'[Kline {period}] {code} failed: {e}')
+        finally:
+            self._kline_period_fetching = False
 
     def _check_alert(self, name, code, price, target, direction):
         if direction in ('below', 'both') and price <= target:
@@ -455,12 +526,12 @@ class KlineTooltip(QWidget):
             p.end()
             return
 
-        # 标题: 名称 + 最新价
+        # 标题: 名称 + 代码 + 最新价
         last = self.klines[-1]
         first = self.klines[0]
         p.setPen(QColor(get_color('text')))
         p.setFont(QFont('Microsoft YaHei UI', 9, QFont.Bold))
-        title = f'{self.name}  {last["close"]:.2f}'
+        title = f'{self.name}  {self.code}  {last["close"]:.2f}'
         p.drawText(10, 16, title)
 
         # 涨跌幅
@@ -619,24 +690,91 @@ class QuoteCard(QFrame):
         self.setMouseTracking(True)
         self.setAttribute(Qt.WA_Hover, True)
 
+        # K线周期切换按钮（浮动在卡片右侧内容上方，不占布局空间）
+        self._period_buttons = {}
+        self._period_active = '1min'
+        for period, text in [('1min', '分时'), ('daily', '日K'), ('weekly', '周K')]:
+            btn = QLabel(text, self)
+            btn.setFixedHeight(14)
+            btn.setFixedWidth(28)
+            btn.setAlignment(Qt.AlignCenter)
+            btn.setStyleSheet(self._period_btn_style(period == '1min'))
+            btn.setAttribute(Qt.WA_Hover, True)
+            btn.setMouseTracking(True)
+            btn.installEventFilter(self)
+            btn.setVisible(False)
+            self._period_buttons[period] = btn
+
+    def _period_btn_style(self, active):
+        """周期按钮样式: active=当前选中(高亮) / inactive=普通"""
+        if active:
+            return (f'color: {COLOR_DOWN}; font-size: 8px; font-weight: 600;'
+                    f'background: {get_color("border")};'
+                    f'border: 1px solid {COLOR_DOWN}; border-radius: 2px;')
+        return (f'color: {get_color("text")}; font-size: 8px;'
+                f'background: {get_color("bg_light")};'
+                f'border: 1px solid {get_color("border")}; border-radius: 2px;')
+
+    def _show_period_buttons(self):
+        """定位并显示周期切换按钮（浮在卡片左侧名称之后，不额外占地方）"""
+        self._period_active = '1min'
+        # 起始位置：名称(70) + 市场(16) + 边距(4+4) 之后
+        x = 4 + 70 + 4 + 16 + 4
+        for period in ['1min', 'daily', 'weekly']:
+            btn = self._period_buttons[period]
+            btn.setStyleSheet(self._period_btn_style(period == '1min'))
+            btn.move(x, 5)
+            btn.raise_()
+            btn.setVisible(True)
+            x += 30
+
     def enterEvent(self, event):
-        """鼠标进入卡片: 300ms防抖后请求K线"""
+        """鼠标进入卡片: 300ms防抖后请求K线，并显示周期按钮"""
         self._hover_timer.start(300)
+        self._show_period_buttons()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        """鼠标离开卡片: 取消请求并隐藏K线图"""
+        """鼠标离开卡片: 取消请求并隐藏K线图和按钮"""
         self._hover_timer.stop()
+        for btn in self._period_buttons.values():
+            btn.setVisible(False)
         win = self.window()
         if hasattr(win, 'hide_kline_tooltip'):
             win.hide_kline_tooltip()
         super().leaveEvent(event)
 
+    def eventFilter(self, obj, event):
+        """处理周期按钮的 hover: 指向哪个按钮就切换到对应周期K线"""
+        from PySide6.QtCore import QEvent
+        if event.type() == QEvent.HoverEnter:
+            for period, btn in self._period_buttons.items():
+                if obj == btn:
+                    self._period_active = period
+                    for p, b in self._period_buttons.items():
+                        b.setStyleSheet(self._period_btn_style(p == period))
+                    self._request_kline_with_period(period)
+                    return True
+        elif event.type() == QEvent.HoverLeave:
+            for btn in self._period_buttons.values():
+                if obj == btn:
+                    # 离开按钮时保持当前 active 高亮
+                    for p, b in self._period_buttons.items():
+                        b.setStyleSheet(self._period_btn_style(p == self._period_active))
+                    return True
+        return super().eventFilter(obj, event)
+
     def _request_kline(self):
-        """请求该股票的1分钟K线"""
+        """请求该股票的分时K线（默认1分钟）"""
         win = self.window()
         if hasattr(win, 'show_kline_for_card'):
-            win.show_kline_for_card(self.code, self.name, QCursor.pos())
+            win.show_kline_for_card(self.code, self.name, QCursor.pos(), '1min')
+
+    def _request_kline_with_period(self, period):
+        """请求对应周期的K线（从缓存取，零延迟）"""
+        win = self.window()
+        if hasattr(win, 'show_kline_for_card'):
+            win.show_kline_for_card(self.code, self.name, QCursor.pos(), period)
 
     def _update_name_elided(self):
         """截断长名称显示"""
@@ -1601,18 +1739,23 @@ class FloatingWindow(QWidget):
             self._uptime_timer.stop()
         self.status_dot.setStyleSheet(f'color: {COLOR_FLAT}; font-size: 9px;')
 
-    def show_kline_for_card(self, code, name, mouse_pos):
-        """Show kline tooltip instantly from cache (zero latency)"""
+    def show_kline_for_card(self, code, name, mouse_pos, period='1min'):
+        """Show kline tooltip instantly from cache (zero latency)
+        period: '1min' | 'daily' | 'weekly'
+        """
+        cache_key = code if period == '1min' else f'{code}_{period}'
         klines = []
         if self.worker and hasattr(self.worker, 'kline_cache'):
-            cached = self.worker.kline_cache.get(code)
+            cached = self.worker.kline_cache.get(cache_key)
             if cached:
                 klines = cached[1]
-        if klines:
-            self._show_kline_tooltip(code, name, klines, mouse_pos)
+        # 有缓存则显示；无缓存（日K/周K尚未加载）也显示空态，保持位置稳定
+        self._show_kline_tooltip(code, name, klines, mouse_pos, period)
 
-    def _show_kline_tooltip(self, code, name, klines, mouse_pos):
-        """显示K线悬浮图, 智能定位"""
+    def _show_kline_tooltip(self, code, name, klines, mouse_pos, period='1min'):
+        """显示K线悬浮图, 智能定位
+        切换周期时若tooltip已可见，仅更新数据不重定位，避免图跳动
+        """
         size_key = self.config.get('kline_size', 'small')
         if self._kline_tooltip is None:
             self._kline_tooltip = KlineTooltip(size_key)
@@ -1621,26 +1764,29 @@ class FloatingWindow(QWidget):
             self._kline_tooltip.close()
             self._kline_tooltip = KlineTooltip(size_key)
 
+        already_visible = self._kline_tooltip.isVisible()
         self._kline_tooltip.set_data(code, name, klines)
 
-        screen = QApplication.primaryScreen().availableGeometry()
-        tip_w = self._kline_tooltip.width()
-        tip_h = self._kline_tooltip.height()
+        # 仅在首次显示时定位；切周期时保持位置不变
+        if not already_visible:
+            screen = QApplication.primaryScreen().availableGeometry()
+            tip_w = self._kline_tooltip.width()
+            tip_h = self._kline_tooltip.height()
 
-        # 默认: 鼠标右下方
-        x = mouse_pos.x() + 15
-        y = mouse_pos.y() + 15
-        # 右侧不够 → 左侧
-        if x + tip_w > screen.right():
-            x = mouse_pos.x() - tip_w - 15
-        # 下方不够 → 上方
-        if y + tip_h > screen.bottom():
-            y = mouse_pos.y() - tip_h - 15
-        # 确保不超出屏幕
-        x = max(screen.left(), min(x, screen.right() - tip_w))
-        y = max(screen.top(), min(y, screen.bottom() - tip_h))
+            # 默认: 鼠标右下方
+            x = mouse_pos.x() + 15
+            y = mouse_pos.y() + 15
+            # 右侧不够 → 左侧
+            if x + tip_w > screen.right():
+                x = mouse_pos.x() - tip_w - 15
+            # 下方不够 → 上方
+            if y + tip_h > screen.bottom():
+                y = mouse_pos.y() - tip_h - 15
+            # 确保不超出屏幕
+            x = max(screen.left(), min(x, screen.right() - tip_w))
+            y = max(screen.top(), min(y, screen.bottom() - tip_h))
+            self._kline_tooltip.move(x, y)
 
-        self._kline_tooltip.move(x, y)
         self._kline_tooltip.show()
         self._kline_tooltip.raise_()
 

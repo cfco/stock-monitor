@@ -1137,26 +1137,36 @@ def get_quotes_batch(codes, source='auto', host=None):
     return results
 
 
-def get_kline_1min(code, count=60):
-    """获取1分钟K线数据
-    A股: 东方财富接口
-    美股/韩股: Yahoo Finance
-    返回: [{'time': 'HH:MM', 'open': x, 'high': x, 'low': x, 'close': x, 'volume': x}, ...]
+def get_kline(code, period='1min', count=60):
+    """获取K线数据（多周期）
+    period: '1min' | 'daily' | 'weekly'
+    A股: 东方财富 (klt=1/101/102)
+    美股/韩股/港股: Yahoo (interval=1m/1d/1wk)
+    返回: [{'time': str, 'open': float, 'high': float, 'low': float, 'close': float, 'volume': float}, ...]
     """
     market = detect_market(code)
     if market == 'a_share':
-        return _get_kline_eastmoney(code, count)
+        return _get_kline_eastmoney(code, count, period)
     elif market in ('us', 'kr', 'yahoo', 'hk'):
-        return _get_kline_yahoo(code, count)
+        return _get_kline_yahoo(code, count, period)
     return []
 
 
-def _get_kline_eastmoney(code, count=60):
-    """东方财富1分钟K线 (A股)
-    klt=1 表示1分钟, fqt=1 前复权
+def get_kline_1min(code, count=60):
+    """获取1分钟K线数据（兼容旧接口）"""
+    return get_kline(code, '1min', count)
+
+
+def _get_kline_eastmoney(code, count=60, period='1min'):
+    """东方财富K线 (A股)
+    period: '1min'(klt=1) | 'daily'(klt=101) | 'weekly'(klt=102)
+    fqt=1 前复权
     """
     import urllib.request
     import json as _json
+
+    klt_map = {'1min': 1, 'daily': 101, 'weekly': 102}
+    klt = klt_map.get(period, 1)
 
     c = code.lower()
     if c.startswith('sh'):
@@ -1168,7 +1178,7 @@ def _get_kline_eastmoney(code, count=60):
 
     url = (
         f'http://push2his.eastmoney.com/api/qt/stock/kline/get'
-        f'?secid={secid}&klt=1&fqt=1&end=20500101&lmt={count}'
+        f'?secid={secid}&klt={klt}&fqt=1&end=20500101&lmt={count}'
         f'&fields1=f1,f2,f3,f5,f6'
         f'&fields2=f51,f52,f53,f54,f55,f56'
     )
@@ -1191,7 +1201,13 @@ def _get_kline_eastmoney(code, count=60):
             continue
         try:
             # f51=时间, f52=开, f53=收, f54=高, f55=低, f56=量
-            time_str = parts[0].split(' ')[-1] if ' ' in parts[0] else parts[0]
+            raw_time = parts[0].split(' ')[0] if ' ' in parts[0] else parts[0]
+            if period == '1min':
+                time_str = parts[0].split(' ')[-1] if ' ' in parts[0] else parts[0]
+            else:
+                # 日K/周K: raw_time = 'YYYY-MM-DD' → 'MM-DD'
+                segs = raw_time.split('-')
+                time_str = f'{segs[1]}-{segs[2]}' if len(segs) >= 3 else raw_time
             result.append({
                 'time': time_str,
                 'open': float(parts[1]),
@@ -1205,20 +1221,25 @@ def _get_kline_eastmoney(code, count=60):
     return result
 
 
-def _get_kline_yahoo(code, count=60):
-    """Yahoo Finance 1分钟K线 (美股/韩股)
-    range=1h 约60根1分钟K线
+def _get_kline_yahoo(code, count=60, period='1min'):
+    """Yahoo Finance K线 (美股/韩股/港股)
+    period: '1min'(interval=1m&range=1h) | 'daily'(interval=1d&range=1y) | 'weekly'(interval=1wk&range=2y)
     """
     import urllib.request
     import json as _json
     import time as _time
+
+    range_map = {'1min': '1h', 'daily': '1y', 'weekly': '2y'}
+    interval_map = {'1min': '1m', 'daily': '1d', 'weekly': '1wk'}
+    interval = interval_map.get(period, '1m')
+    range_val = range_map.get(period, '1h')
 
     symbol = code
     if code.lower().startswith('kr'):
         num = code[2:]
         symbol = f'{num}.KS' if num.startswith('0') and len(num) == 6 else f'{num}.KQ'
 
-    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1h'
+    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval}&range={range_val}'
     req = urllib.request.Request(url, headers={
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     })
@@ -1252,7 +1273,11 @@ def _get_kline_yahoo(code, count=60):
         v = volumes[i] if i < len(volumes) else 0
         if o is None or c is None or h is None or l is None:
             continue
-        time_str = _time.strftime('%H:%M', _time.localtime(timestamps[i]))
+        if period == '1min':
+            time_str = _time.strftime('%H:%M', _time.localtime(timestamps[i]))
+        else:
+            # 日K/周K: 显示 月-日
+            time_str = _time.strftime('%m-%d', _time.localtime(timestamps[i]))
         result.append({
             'time': time_str,
             'open': o, 'high': h, 'low': l, 'close': c,
