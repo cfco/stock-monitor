@@ -23,18 +23,18 @@
     {
       "code": "sh510210",
       "name": "上证指数ETF富国",
-      "target": null,
-      "dir": "below",
+      "target": 1.0,
+      "dir": "above",
       "target_pct": null,
       "pct_dir": "both",
-      "position": "",
+      "position": "多仓",
       "note": ""
     },
     {
       "code": "sh601398",
       "name": "工商银行",
       "target": null,
-      "dir": "below",
+      "dir": "both",
       "target_pct": null,
       "pct_dir": "both",
       "position": "",
@@ -54,7 +54,7 @@
       "code": "sh601988",
       "name": "中国银行",
       "target": null,
-      "dir": "below",
+      "dir": "both",
       "target_pct": null,
       "pct_dir": "both",
       "position": "",
@@ -66,7 +66,7 @@
       "target": null,
       "dir": "below",
       "target_pct": null,
-      "pct_dir": "both",
+      "pct_dir": "above",
       "position": "",
       "note": ""
     },
@@ -84,7 +84,7 @@
       "code": "sz000988",
       "name": "华工科技",
       "target": null,
-      "dir": "below",
+      "dir": "above",
       "target_pct": null,
       "pct_dir": "both",
       "position": "",
@@ -93,5 +93,6 @@
   ],
   "interval": 2,
   "source": "auto",
-  "kline_size": "large"
+  "kline_size": "large",
+  "theme": "auto"
 }

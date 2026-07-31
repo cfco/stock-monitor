@@ -16,6 +16,10 @@ import threading
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'scripts'))
 from price_alert import get_quote, detect_market, close_tdx_client, get_quotes_batch, get_kline_1min
 
+# 调试日志（空实现，避免修改所有调用处）
+def _log(msg):
+    pass
+
 from PySide6.QtCore import Qt, QThread, Signal, QPoint, QRect, QTimer, QSize
 from PySide6.QtGui import (
     QFont, QColor, QPalette, QIcon, QPainter, QBrush, QPen,
@@ -35,18 +39,67 @@ from PySide6.QtWidgets import (
 VERSION = "5.0"
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'scripts', 'watchlist_config.json')
 
-# 颜色
+# 颜色 - 涨跌色（两套主题共用）
 COLOR_UP = '#e74c3c'
 COLOR_DOWN = '#2ecc71'
 COLOR_FLAT = '#95a5a6'
-COLOR_BG = '#1a1a2e'
-COLOR_BG_LIGHT = '#252540'
-COLOR_TEXT = '#ffffff'
-COLOR_TEXT_DIM = '#aaaaaa'
-COLOR_BORDER = '#3a3a55'
 COLOR_ALERT = '#ff5555'
-COLOR_TRIGGERED = '#2ecc71'
-COLOR_DEFAULT_CARD = '#1a1a2e'
+COLOR_TRIGGERED = '#00e676'  # 预警触发荧光绿
+
+# 双主题
+THEME_DARK = {
+    'bg': '#1a1a2e',
+    'bg_light': '#252540',
+    'text': '#ffffff',
+    'text_dim': '#aaaaaa',
+    'border': '#3a3a55',
+    'default_card': '#1a1a2e',
+}
+THEME_LIGHT = {
+    'bg': '#f5f5f5',
+    'bg_light': '#e8e8e8',
+    'text': '#1a1a1a',
+    'text_dim': '#666666',
+    'border': '#cccccc',
+    'default_card': '#ffffff',
+}
+
+# 当前主题（启动时默认深色）
+_current_theme = 'dark'
+_theme = THEME_DARK
+
+def get_color(key):
+    """获取当前主题颜色"""
+    return _theme.get(key, THEME_DARK[key])
+
+def set_theme(theme_name):
+    """切换主题: 'dark' 或 'light'"""
+    global _current_theme, _theme
+    _current_theme = theme_name
+    _theme = THEME_DARK if theme_name == 'dark' else THEME_LIGHT
+
+def get_current_theme():
+    return _current_theme
+
+# 兼容性: 保留 COLOR_BG 等名称但改为动态函数调用
+# 由于代码中大量使用 f'{COLOR_BG}' 拼接，这里用属性对象保持兼容
+class _ColorProxy:
+    """代理对象，str()时返回当前主题对应颜色"""
+    def __init__(self, key):
+        self.key = key
+    def __str__(self):
+        return get_color(self.key)
+    def __repr__(self):
+        return get_color(self.key)
+    def __format__(self, format_spec):
+        return get_color(self.key)
+
+COLOR_BG = _ColorProxy('bg')
+COLOR_BG_LIGHT = _ColorProxy('bg_light')
+COLOR_TEXT = _ColorProxy('text')
+COLOR_TEXT_DIM = _ColorProxy('text_dim')
+COLOR_BORDER = _ColorProxy('border')
+COLOR_DEFAULT_CARD = _ColorProxy('default_card')
 
 CRITICAL_THRESHOLD = 0.01
 
@@ -62,11 +115,11 @@ PCT_DIR_VALUES = {'跌': 'below', '涨': 'above', '双向': 'both'}
 # ============================================================
 def load_config():
     try:
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+        with open(CONFIG_FILE, 'r', encoding='utf-8-sig') as f:
             return json.load(f)
     except Exception as e:
         print(f'Error loading config: {e}')
-        return {'interval': 5, 'source': 'auto', 'alerts': []}
+        return {'interval': 5, 'source': 'auto', 'alerts': [], 'theme': 'auto'}
 
 
 def save_config(config):
@@ -302,6 +355,55 @@ KLINE_SIZES = {
 }
 
 
+# ============================================================
+# 屏幕颜色采样检测器
+# ============================================================
+class _ScreenColorDetector:
+    """采样软件窗口周围桌面区域的像素亮度，判断深浅"""
+
+    def __init__(self, window):
+        self.window = window
+
+    def detect(self):
+        """返回 'dark' 或 'light'"""
+        try:
+            import random
+            screen = self.window.screen()
+            if not screen:
+                return 'dark'
+            geo = screen.geometry()
+            pixmap = screen.grabWindow(0, geo.x(), geo.y(), geo.width(), geo.height())
+            img = pixmap.toImage()
+            win_geo = self.window.geometry()
+            samples = []
+            for _ in range(200):
+                side = random.choice(['top', 'bottom', 'left', 'right'])
+                if side == 'top':
+                    x = random.randint(win_geo.left(), max(win_geo.left(), win_geo.right()))
+                    y = random.randint(max(0, win_geo.top() - 30), max(0, win_geo.top() - 5))
+                elif side == 'bottom':
+                    x = random.randint(win_geo.left(), max(win_geo.left(), win_geo.right()))
+                    y = random.randint(win_geo.bottom() + 5, min(geo.height(), win_geo.bottom() + 30))
+                elif side == 'left':
+                    x = random.randint(max(0, win_geo.left() - 30), max(0, win_geo.left() - 5))
+                    y = random.randint(win_geo.top(), max(win_geo.top(), win_geo.bottom()))
+                else:
+                    x = random.randint(win_geo.right() + 5, min(geo.width(), win_geo.right() + 30))
+                    y = random.randint(win_geo.top(), max(win_geo.top(), win_geo.bottom()))
+                if 0 <= x < img.width() and 0 <= y < img.height():
+                    pixel = img.pixelColor(x, y)
+                    samples.append(pixel.lightness())
+            if not samples:
+                return 'dark'
+            avg = sum(samples) / len(samples)
+            return 'light' if avg > 128 else 'dark'
+        except Exception:
+            return 'dark'
+
+
+# ============================================================
+# K线悬浮图
+# ============================================================
 class KlineTooltip(QWidget):
     """K线悬浮图窗口（无边框、置顶、鼠标穿透）"""
 
@@ -340,14 +442,14 @@ class KlineTooltip(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
 
         # 背景
-        bg_color = QColor(COLOR_BG)
+        bg_color = QColor(get_color('bg'))
         bg_color.setAlpha(245)
         p.setBrush(QBrush(bg_color))
-        p.setPen(QPen(QColor(COLOR_BORDER), 1))
+        p.setPen(QPen(QColor(get_color('border')), 1))
         p.drawRoundedRect(0, 0, self.width(), self.height(), 8, 8)
 
         if not self.klines:
-            p.setPen(QColor(COLOR_TEXT_DIM))
+            p.setPen(QColor(get_color('text_dim')))
             p.setFont(QFont('Microsoft YaHei UI', 9))
             p.drawText(self.rect(), Qt.AlignCenter, '暂无K线数据')
             p.end()
@@ -356,7 +458,7 @@ class KlineTooltip(QWidget):
         # 标题: 名称 + 最新价
         last = self.klines[-1]
         first = self.klines[0]
-        p.setPen(QColor(COLOR_TEXT))
+        p.setPen(QColor(get_color('text')))
         p.setFont(QFont('Microsoft YaHei UI', 9, QFont.Bold))
         title = f'{self.name}  {last["close"]:.2f}'
         p.drawText(10, 16, title)
@@ -417,7 +519,7 @@ class KlineTooltip(QWidget):
             p.drawRect(x, body_top, bar_w, body_h)
 
         # 价格标注
-        p.setPen(QColor(COLOR_TEXT_DIM))
+        p.setPen(QColor(get_color('text_dim')))
         p.setFont(QFont('Microsoft YaHei UI', 7))
         p.drawText(x0 + 2, y0 + 8, f'{max_price:.2f}')
         p.drawText(x0 + 2, y0 + h, f'{min_price:.2f}')
@@ -462,7 +564,7 @@ class QuoteCard(QFrame):
         self.name_label.setFixedWidth(70)
         self.name_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.name_label.setStyleSheet(
-            f'color: {COLOR_TEXT}; font-size: 10px; font-weight: 600;'
+            f'color: {get_color("text")}; font-size: 10px; font-weight: 600;'
         )
         self._update_name_elided()
         layout.addWidget(self.name_label)
@@ -472,8 +574,8 @@ class QuoteCard(QFrame):
         self.market_label.setFixedWidth(16)
         self.market_label.setAlignment(Qt.AlignCenter)
         self.market_label.setStyleSheet(
-            f'color: {COLOR_TEXT_DIM}; font-size: 8px;'
-            f'border: 1px solid {COLOR_BORDER}; border-radius: 2px;'
+            f'color: {get_color("text_dim")}; font-size: 8px;'
+            f'border: 1px solid {get_color("border")}; border-radius: 2px;'
         )
         layout.addWidget(self.market_label)
 
@@ -482,7 +584,7 @@ class QuoteCard(QFrame):
         self.price_label.setFixedWidth(70)
         self.price_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.price_label.setStyleSheet(
-            f'color: {COLOR_TEXT}; font-size: 12px; font-weight: 700;'
+            f'color: {get_color("text")}; font-size: 12px; font-weight: 700;'
         )
         layout.addWidget(self.price_label)
 
@@ -498,14 +600,14 @@ class QuoteCard(QFrame):
         # 状态/触发信息（弹性）
         self.status_label = QLabel('')
         self.status_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.status_label.setStyleSheet(f'color: {COLOR_TEXT_DIM}; font-size: 9px;')
+        self.status_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 9px;')
         layout.addWidget(self.status_label, 1)
 
         # 更新时间
         self.time_label = QLabel('')
         self.time_label.setFixedWidth(48)
         self.time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.time_label.setStyleSheet(f'color: {COLOR_TEXT_DIM}; font-size: 8px;')
+        self.time_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 8px;')
         layout.addWidget(self.time_label)
 
         self._apply_default_style()
@@ -547,21 +649,44 @@ class QuoteCard(QFrame):
         self._triggered = False
         self.setStyleSheet(
             f'#quoteCard {{'
-            f'  background: {COLOR_DEFAULT_CARD};'
-            f'  border: 1px solid {COLOR_BORDER};'
+            f'  background: {get_color("default_card")};'
+            f'  border: 1px solid {get_color("border")};'
             f'  border-radius: 6px;'
             f'}}'
+            f'QLabel {{ background: transparent; color: {get_color("text")}; }}'
         )
+        self.update()
 
     def _apply_triggered_style(self):
         self._triggered = True
         self.setStyleSheet(
             f'#quoteCard {{'
             f'  background: {COLOR_TRIGGERED};'
-            f'  border: 1px solid {COLOR_TRIGGERED};'
+            f'  border: 2px solid #ffffff;'
             f'  border-radius: 6px;'
             f'}}'
+            f'QLabel {{ background: transparent; color: #000000; }}'
         )
+        self.update()
+
+    def paintEvent(self, event):
+        """重写paintEvent确保触发时整个卡片背景完全覆盖"""
+        if self._triggered:
+            from PySide6.QtGui import QPainter, QColor, QPen, QBrush
+            from PySide6.QtCore import QRectF
+            p = QPainter(self)
+            p.setRenderHint(QPainter.Antialiasing)
+            rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+            # 填充背景
+            p.setBrush(QBrush(QColor(COLOR_TRIGGERED)))
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(rect, 6, 6)
+            # 白色边框
+            p.setPen(QPen(QColor('#ffffff'), 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(rect, 6, 6)
+            p.end()
+        super().paintEvent(event)
 
     def set_data(self, data):
         price = data.get('price')
@@ -643,25 +768,8 @@ class QuoteCard(QFrame):
                 direction_cn = '跌' if change_pct < 0 else '涨'
                 trigger_reason = f'{direction_cn}≥{abs_target}%'
 
-        # 状态显示
-        if triggered:
-            self.status_label.setText(f'●{trigger_reason}')
-            self.status_label.setStyleSheet(
-                f'color: white; font-size: 9px; font-weight: 600;'
-            )
-        elif target is not None or target_pct is not None:
-            parts = []
-            if target is not None:
-                parts.append(f'{DIR_LABELS.get(direction, direction)}{target}')
-            if target_pct is not None:
-                pct_dir = data.get('pct_dir', 'both')
-                parts.append(f'{PCT_DIR_LABELS.get(pct_dir, pct_dir)}{abs(target_pct)}%')
-            self.status_label.setText(' '.join(parts))
-            self.status_label.setStyleSheet(
-                f'color: {COLOR_TEXT_DIM}; font-size: 9px;'
-            )
-        else:
-            self.status_label.setText('')
+        # 状态显示：不显示预警文字，仅通过绿色底色表示触发
+        self.status_label.setText('')
 
         # 只在状态变化时切换样式
         if triggered and not self._triggered:
@@ -686,10 +794,103 @@ class QuoteCard(QFrame):
         else:
             self.market_label.setText(market_text)
             self.market_label.setStyleSheet(
-                f'color: {COLOR_TEXT_DIM}; font-size: 9px;'
-                f'border: 1px solid {COLOR_BORDER}; border-radius: 2px;'
+                f'color: {get_color("text_dim")}; font-size: 9px;'
+                f'border: 1px solid {get_color("border")}; border-radius: 2px;'
             )
 
+    def _on_theme_changed(self):
+        """主题切换时刷新所有标签颜色"""
+        self.name_label.setStyleSheet(
+            f'color: {get_color("text")}; font-size: 10px; font-weight: 600;'
+        )
+        self.price_label.setStyleSheet(
+            f'color: {get_color("text")}; font-size: 12px; font-weight: 700;'
+        )
+        self.time_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 8px;')
+        self.status_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 9px;')
+        # 市场标签
+        self.market_label.setStyleSheet(
+            f'color: {get_color("text_dim")}; font-size: 9px;'
+            f'border: 1px solid {get_color("border")}; border-radius: 2px;'
+        )
+        # 重新应用卡片样式
+        if self._triggered:
+            self._apply_triggered_style()
+        else:
+            self._apply_default_style()
+        self._update_name_elided()
+
+
+
+# ============================================================
+# 异步股票代码查询线程（避免网络请求阻塞UI）
+# ============================================================
+class _StockResolveThread(QThread):
+    """在后台线程查询股票代码，避免阻塞UI事件循环"""
+    finished_resolve = Signal(list)  # 传递候选列表 [(code, name), ...]
+
+    def __init__(self, input_text):
+        super().__init__()
+        self.input_text = input_text
+
+    def run(self):
+        _log(f'[Thread] run() 开始, input="{self.input_text}"')
+        candidates = []
+        try:
+            from price_alert import get_quote_tencent
+            text = self.input_text.strip()
+            lower_text = text.lower()
+
+            # 已带前缀
+            if lower_text.startswith(('sh', 'sz', 'hk', 'us', 'bj')):
+                if lower_text.startswith('us') and text[2:].islower():
+                    text = 'us' + text[2:].upper()
+                try:
+                    q = get_quote_tencent(text)
+                    name = q.get('name', '')
+                    price = q.get('price')
+                    if name and name != text and price and price > 0:
+                        candidates = [(text, name)]
+                    else:
+                        candidates = [(text, '')]
+                except Exception:
+                    candidates = [(text, '')]
+
+            # 6位数字: sh 和 sz 两边都查
+            elif text.isdigit() and len(text) == 6:
+                for prefix in ['sh', 'sz']:
+                    full_code = prefix + text
+                    try:
+                        q = get_quote_tencent(full_code)
+                        name = q.get('name', '')
+                        price = q.get('price')
+                        if name and name != full_code and price and price > 0:
+                            candidates.append((full_code, name))
+                    except Exception:
+                        continue
+                if not candidates:
+                    candidates = [('sh' + text, '')]
+
+            # 纯字母：美股
+            elif text.isalpha():
+                full_code = 'us' + text.upper()
+                try:
+                    q = get_quote_tencent(full_code)
+                    name = q.get('name', '')
+                    price = q.get('price')
+                    if name and name != full_code and price and price > 0:
+                        candidates = [(full_code, name)]
+                    else:
+                        candidates = [(full_code, '')]
+                except Exception:
+                    candidates = [(full_code, '')]
+
+            _log(f'[Thread] run() 完成, candidates={candidates}')
+        except Exception as e:
+            import traceback
+            _log(f'[Thread] run() 异常: {e}\n{traceback.format_exc()}')
+
+        self.finished_resolve.emit(candidates)
 
 
 # ============================================================
@@ -703,34 +904,39 @@ class SettingsDialog(QDialog):
         self.config = json.loads(json.dumps(config))
         self._build_ui()
         self._load_table()
+        # 监听代码单元格变化，自动解析名称
+        self.table.cellChanged.connect(self._on_code_changed)
+        self._block_signals = False  # 防止信号循环
+        self._resolve_thread = None  # 异步查询线程引用
+        _log('[SettingsDialog] 初始化完成, cellChanged已连接')
 
     def _build_ui(self):
         self.setWindowTitle('监控设置')
         self.setMinimumSize(720, 520)
         self.setStyleSheet(
-            f'QDialog {{ background: {COLOR_BG}; color: {COLOR_TEXT}; }}'
-            f'QLabel {{ color: {COLOR_TEXT}; font-size: 12px; }}'
+            f'QDialog {{ background: {get_color("bg")}; color: {get_color("text")}; }}'
+            f'QLabel {{ color: {get_color("text")}; font-size: 12px; }}'
             f'QLineEdit, QComboBox, QSpinBox {{'
-            f'  background: {COLOR_BG_LIGHT}; color: {COLOR_TEXT};'
-            f'  border: 1px solid {COLOR_BORDER}; border-radius: 4px;'
+            f'  background: {get_color("bg_light")}; color: {get_color("text")};'
+            f'  border: 1px solid {get_color("border")}; border-radius: 4px;'
             f'  padding: 4px 6px; font-size: 12px;'
             f'}}'
             f'QLineEdit:focus, QComboBox:focus {{ border-color: {COLOR_DOWN}; }}'
             f'QComboBox QAbstractItemView {{'
-            f'  background: {COLOR_BG_LIGHT}; color: {COLOR_TEXT};'
-            f'  border: 1px solid {COLOR_BORDER};'
-            f'  selection-background-color: {COLOR_BORDER}; selection-color: {COLOR_TEXT};'
+            f'  background: {get_color("bg_light")}; color: {get_color("text")};'
+            f'  border: 1px solid {get_color("border")};'
+            f'  selection-background-color: {get_color("border")}; selection-color: {get_color("text")};'
             f'  outline: none; padding: 2px; font-size: 12px;'
             f'}}'
             f'QComboBox::drop-down {{ border: none; width: 20px; }}'
             f'QComboBox::down-arrow {{ image: none; border-left: 4px solid transparent;'
-            f'  border-right: 4px solid transparent; border-top: 5px solid {COLOR_TEXT_DIM}; }}'
+            f'  border-right: 4px solid transparent; border-top: 5px solid {get_color("text_dim")}; }}'
             f'QSpinBox::up-button, QSpinBox::down-button {{'
-            f'  background: {COLOR_BG_LIGHT}; border: none; width: 16px; }}'
+            f'  background: {get_color("bg_light")}; border: none; width: 16px; }}'
             f'QSpinBox::up-arrow {{ border-left: 3px solid transparent;'
-            f'  border-right: 3px solid transparent; border-bottom: 4px solid {COLOR_TEXT_DIM}; }}'
+            f'  border-right: 3px solid transparent; border-bottom: 4px solid {get_color("text_dim")}; }}'
             f'QSpinBox::down-arrow {{ border-left: 3px solid transparent;'
-            f'  border-right: 3px solid transparent; border-top: 4px solid {COLOR_TEXT_DIM}; }}'
+            f'  border-right: 3px solid transparent; border-top: 4px solid {get_color("text_dim")}; }}'
         )
 
         layout = QVBoxLayout(self)
@@ -739,7 +945,7 @@ class SettingsDialog(QDialog):
         # 全局设置
         top_box = QGroupBox('全局设置')
         top_box.setStyleSheet(
-            f'QGroupBox {{ color: {COLOR_TEXT}; border: 1px solid {COLOR_BORDER};'
+            f'QGroupBox {{ color: {get_color("text")}; border: 1px solid {get_color("border")};'
             f'  border-radius: 6px; margin-top: 10px; padding-top: 14px;'
             f'  font-weight: 600; font-size: 12px;'
             f'}}'
@@ -763,6 +969,11 @@ class SettingsDialog(QDialog):
         self.source_combo.addItems(['auto', 'tencent', 'yahoo', 'tdx'])
         self.source_combo.setCurrentText(self.config.get('source', 'auto'))
         top_form.addRow('数据源:', self.source_combo)
+
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(['auto', 'dark', 'light'])
+        self.theme_combo.setCurrentText(self.config.get('theme', 'auto'))
+        top_form.addRow('主题:', self.theme_combo)
         layout.addWidget(top_box)
 
         # 表格
@@ -782,14 +993,14 @@ class SettingsDialog(QDialog):
         self.table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.SelectedClicked)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setStyleSheet(
-            f'QTableWidget {{ gridline-color: {COLOR_BORDER};'
-            f'  background: {COLOR_BG}; alternate-background-color: {COLOR_BG_LIGHT};'
-            f'  border: 1px solid {COLOR_BORDER}; border-radius: 6px;'
+            f'QTableWidget {{ gridline-color: {get_color("border")};'
+            f'  background: {get_color("bg")}; alternate-background-color: {get_color("bg_light")};'
+            f'  border: 1px solid {get_color("border")}; border-radius: 6px;'
             f'}}'
             f'QTableWidget::item {{ padding: 4px; }}'
             f'QHeaderView::section {{'
-            f'  background: {COLOR_BG_LIGHT}; color: {COLOR_TEXT};'
-            f'  padding: 4px; border: none; border-right: 1px solid {COLOR_BORDER};'
+            f'  background: {get_color("bg_light")}; color: {get_color("text")};'
+            f'  padding: 4px; border: none; border-right: 1px solid {get_color("border")};'
             f'  font-weight: 600;'
             f'}}'
         )
@@ -835,6 +1046,7 @@ class SettingsDialog(QDialog):
         layout.addLayout(bottom)
 
     def _load_table(self):
+        self._loading = True
         alerts = self.config.get('alerts', [])
         self.table.setRowCount(len(alerts))
         dir_items = ['below', 'above', 'both']
@@ -866,11 +1078,12 @@ class SettingsDialog(QDialog):
             )
             del_btn.clicked.connect(lambda _=False, r=row: self._delete_row(r))
             self.table.setCellWidget(row, 8, del_btn)
+        self._loading = False
 
     def _set_cell(self, row, col, value):
         item = QTableWidgetItem(str(value))
         item.setTextAlignment(Qt.AlignCenter)
-        item.setForeground(QColor(COLOR_TEXT))
+        item.setForeground(QColor(get_color('text')))
         self.table.setItem(row, col, item)
 
     def _set_combo_cell(self, row, col, value, items, labels=None):
@@ -887,8 +1100,8 @@ class SettingsDialog(QDialog):
             combo.addItems(items)
             combo.setCurrentText(value if value in items else items[0])
         combo.setStyleSheet(
-            f'QComboBox {{ background: {COLOR_BG_LIGHT}; color: {COLOR_TEXT};'
-            f'  border: 1px solid {COLOR_BORDER}; border-radius: 3px; padding: 2px 4px;'
+            f'QComboBox {{ background: {get_color("bg_light")}; color: {get_color("text")};'
+            f'  border: 1px solid {get_color("border")}; border-radius: 3px; padding: 2px 4px;'
             f'}}'
         )
         self.table.setCellWidget(row, col, combo)
@@ -926,6 +1139,81 @@ class SettingsDialog(QDialog):
 
     def _delete_row(self, row):
         self.table.removeRow(row)
+
+    def _on_code_changed(self, row, col):
+        """代码单元格变化时，启动异步线程搜索名称（避免阻塞UI）"""
+        _log(f'[cellChanged] row={row}, col={col}, block={self._block_signals}, loading={getattr(self, "_loading", False)}')
+        if self._block_signals or getattr(self, '_loading', False):
+            return
+        if col != 0:  # 只处理代码列
+            return
+
+        item = self.table.item(row, col)
+        if not item:
+            return
+        code = item.text().strip()
+        _log(f'[cellChanged] code="{code}"')
+        if not code:
+            return
+
+        # 已带前缀的不再重复查询
+        if code.lower().startswith(('sh', 'sz', 'hk', 'us', 'bj')):
+            _log(f'[cellChanged] 已带前缀，跳过')
+            return
+
+        name_item = self.table.item(row, 1)
+
+        # 如果上一个线程还在跑，等它结束
+        if self._resolve_thread and self._resolve_thread.isRunning():
+            self._resolve_thread.quit()
+            self._resolve_thread.wait(2000)
+
+        # 启动异步查询
+        self._resolve_thread = _StockResolveThread(code)
+        self._resolve_thread._row = row
+        self._resolve_thread._item = item
+        self._resolve_thread._name_item = name_item
+        self._resolve_thread.finished_resolve.connect(self._on_resolve_done)
+        self._resolve_thread.start()
+        _log(f'[cellChanged] 线程已启动')
+
+    def _on_resolve_done(self, candidates):
+        """异步查询完成回调（在主线程执行）"""
+        _log(f'[resolve_done] candidates={candidates}')
+        if not candidates:
+            return
+
+        item = getattr(self._resolve_thread, '_item', None)
+        name_item = getattr(self._resolve_thread, '_name_item', None)
+        _log(f'[resolve_done] item={item is not None}, name_item={name_item is not None}')
+        if item is None:
+            return
+
+        chosen = None
+        if len(candidates) == 1:
+            chosen = candidates[0]
+            _log(f'[resolve_done] 单候选, chosen={chosen}')
+        else:
+            # 多个候选，弹窗选择
+            labels = [f'{c[0]}  {c[1]}' for c in candidates]
+            _log(f'[resolve_done] 多候选={len(candidates)}, 即将弹窗: {labels}')
+            from PySide6.QtWidgets import QInputDialog
+            sel, ok = QInputDialog.getItem(
+                self, '选择股票',
+                f'匹配到以下 {len(candidates)} 只股票，请选择：',
+                labels, 0, False
+            )
+            _log(f'[resolve_done] 弹窗结果: ok={ok}, sel={sel}')
+            if ok and sel:
+                chosen = candidates[labels.index(sel)]
+
+        if chosen:
+            self._block_signals = True
+            item.setText(chosen[0])
+            if name_item:
+                name_item.setText(chosen[1] or '')
+            self._block_signals = False
+            _log(f'[resolve_done] 已填充: code={chosen[0]}, name={chosen[1]}')
 
     def _save_and_close(self):
         alerts = []
@@ -980,6 +1268,7 @@ class SettingsDialog(QDialog):
         self.config['interval'] = self.interval_spin.value()
         self.config['kline_size'] = self.kline_size_combo.currentText()
         self.config['source'] = self.source_combo.currentText()
+        self.config['theme'] = self.theme_combo.currentText()
         self.config['alerts'] = alerts
 
         if save_config(self.config):
@@ -1002,10 +1291,24 @@ class FloatingWindow(QWidget):
         self._drag_offset = None
         self._kline_tooltip = None
         self._kline_fetcher = None
+        self._settings_dialog = None
+
+        # 初始化主题
+        self._theme_mode = self.config.get('theme', 'auto')
+        if self._theme_mode == 'auto':
+            detected = _ScreenColorDetector(self).detect()
+            set_theme(detected)
+        else:
+            set_theme(self._theme_mode)
 
         self._init_window()
         self._init_ui()
         self._move_to_bottom_right()
+
+        # auto 模式下每 10 秒检测屏幕颜色
+        self._theme_timer = QTimer(self)
+        self._theme_timer.timeout.connect(self._check_theme)
+        self._theme_timer.start(3000)
 
         QTimer.singleShot(300, self.start_monitor)
 
@@ -1029,9 +1332,9 @@ class FloatingWindow(QWidget):
         self.container.setObjectName('container')
         self.container.setStyleSheet(
             f'#container {{'
-            f'  background: {COLOR_BG};'
+            f'  background: {get_color("bg")};'
             f'  border-radius: 10px;'
-            f'  border: 1px solid {COLOR_BORDER};'
+            f'  border: 1px solid {get_color("border")};'
             f'}}'
         )
         outer.addWidget(self.container)
@@ -1056,9 +1359,9 @@ class FloatingWindow(QWidget):
         self.scroll.setCornerWidget(None)
         self.scroll.setStyleSheet(
             f'QScrollArea {{ background: transparent; border: none; }}'
-            f'QScrollBar:vertical {{ background: {COLOR_BG_LIGHT}; width: 6px; margin: 0; }}'
-            f'QScrollBar::handle:vertical {{ background: {COLOR_BORDER}; border-radius: 3px; min-height: 20px; }}'
-            f'QScrollBar::handle:vertical:hover {{ background: {COLOR_TEXT_DIM}; }}'
+            f'QScrollBar:vertical {{ background: {get_color("bg_light")}; width: 6px; margin: 0; }}'
+            f'QScrollBar::handle:vertical {{ background: {get_color("border")}; border-radius: 3px; min-height: 20px; }}'
+            f'QScrollBar::handle:vertical:hover {{ background: {get_color("text_dim")}; }}'
             f'QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; background: transparent; }}'
             f'QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}'
             # 水平滚动条：高度设为0，彻底不占空间
@@ -1068,7 +1371,7 @@ class FloatingWindow(QWidget):
         )
 
         self.list_widget = QWidget()
-        self.list_widget.setStyleSheet(f'QWidget {{ background: {COLOR_BG}; }}')
+        self.list_widget.setStyleSheet(f'QWidget {{ background: {get_color("bg")}; }}')
         self.list_layout = QVBoxLayout(self.list_widget)
         self.list_layout.setContentsMargins(2, 2, 2, 2)
         self.list_layout.setSpacing(1)
@@ -1086,7 +1389,7 @@ class FloatingWindow(QWidget):
         bar = QFrame()
         bar.setFixedHeight(32)
         bar.setStyleSheet(
-            f'background: transparent; border-top: 1px solid {COLOR_BORDER};'
+            f'background: transparent; border-top: 1px solid {get_color("border")};'
         )
         h = QHBoxLayout(bar)
         h.setContentsMargins(6, 0, 6, 0)
@@ -1098,11 +1401,11 @@ class FloatingWindow(QWidget):
         h.addWidget(self.status_dot)
 
         self.update_label = QLabel('--:--')
-        self.update_label.setStyleSheet(f'color: {COLOR_TEXT_DIM}; font-size: 9px;')
+        self.update_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 9px;')
         h.addWidget(self.update_label)
 
         self.uptime_label = QLabel('')
-        self.uptime_label.setStyleSheet(f'color: {COLOR_TEXT_DIM}; font-size: 9px;')
+        self.uptime_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 9px;')
         h.addWidget(self.uptime_label)
 
         h.addStretch()
@@ -1112,9 +1415,9 @@ class FloatingWindow(QWidget):
         self.btn_settings.setCursor(Qt.PointingHandCursor)
         self.btn_settings.setFixedSize(24, 20)
         self.btn_settings.setStyleSheet(
-            f'QPushButton {{ background: {COLOR_BG_LIGHT}; color: {COLOR_TEXT};'
-            f'  border: 1px solid {COLOR_BORDER}; border-radius: 4px; font-size: 11px; }}'
-            f'QPushButton:hover {{ background: {COLOR_BORDER}; }}'
+            f'QPushButton {{ background: {get_color("bg_light")}; color: {get_color("text")};'
+            f'  border: 1px solid {get_color("border")}; border-radius: 4px; font-size: 11px; }}'
+            f'QPushButton:hover {{ background: {get_color("border")}; }}'
         )
         self.btn_settings.clicked.connect(self._open_settings)
         h.addWidget(self.btn_settings)
@@ -1201,6 +1504,77 @@ class FloatingWindow(QWidget):
         # 重置滚动区域最小高度
         self.scroll.setMinimumHeight(0)
 
+    def _check_theme(self):
+        """auto 模式下定期检测屏幕颜色，切换主题"""
+        if self._theme_mode != 'auto':
+            return
+        detected = _ScreenColorDetector(self).detect()
+        if detected != get_current_theme():
+            set_theme(detected)
+            self._apply_theme()
+
+    def _apply_theme(self):
+        """主题切换后刷新所有界面元素"""
+        # 容器
+        self.container.setStyleSheet(
+            f'#container {{'
+            f'  background: {get_color("bg")};'
+            f'  border-radius: 10px;'
+            f'  border: 1px solid {get_color("border")};'
+            f'}}'
+        )
+        # 滚动条
+        self.scroll.setStyleSheet(
+            f'QScrollArea {{ background: transparent; border: none; }}'
+            f'QScrollBar:vertical {{ background: {get_color("bg_light")}; width: 6px; margin: 0; }}'
+            f'QScrollBar::handle:vertical {{ background: {get_color("border")}; border-radius: 3px; min-height: 20px; }}'
+            f'QScrollBar::handle:vertical:hover {{ background: {get_color("text_dim")}; }}'
+            f'QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; background: transparent; }}'
+            f'QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}'
+            f'QScrollBar:horizontal {{ height: 0; width: 0; background: transparent; }}'
+            f'QScrollBar::handle:horizontal {{ background: transparent; }}'
+            f'QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ height: 0; width: 0; }}'
+        )
+        # 列表背景
+        self.list_widget.setStyleSheet(f'QWidget {{ background: {get_color("bg")}; }}')
+        # 底栏标签
+        self.update_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 9px;')
+        self.uptime_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 9px;')
+        self.btn_settings.setStyleSheet(
+            f'QPushButton {{ background: {get_color("bg_light")}; color: {get_color("text")};'
+            f'  border: 1px solid {get_color("border")}; border-radius: 4px; font-size: 11px; }}'
+            f'QPushButton:hover {{ background: {get_color("border")}; }}'
+        )
+        # 刷新所有卡片
+        for card in self.cards.values():
+            card._on_theme_changed()
+
+    def _open_settings(self):
+        dlg = SettingsDialog(self.config, self)
+        dlg.config_changed.connect(self._on_config_changed)
+        self._settings_dialog = dlg
+        dlg.exec()
+
+    def _on_config_changed(self, new_config):
+        self.config = new_config
+        # 检查主题是否变化
+        new_theme = new_config.get('theme', 'auto')
+        if new_theme != self._theme_mode:
+            self._theme_mode = new_theme
+            if new_theme == 'auto':
+                detected = _ScreenColorDetector(self).detect()
+                set_theme(detected)
+            else:
+                set_theme(new_theme)
+            self._apply_theme()
+        was_running = self.worker and self.worker.isRunning()
+        if was_running:
+            self.worker.stop()
+            self.worker.wait(2000)
+        self._rebuild_cards()
+        if was_running:
+            self.start_monitor()
+
     def start_monitor(self):
         if self.worker and self.worker.isRunning():
             return
@@ -1226,21 +1600,6 @@ class FloatingWindow(QWidget):
         if hasattr(self, '_uptime_timer'):
             self._uptime_timer.stop()
         self.status_dot.setStyleSheet(f'color: {COLOR_FLAT}; font-size: 9px;')
-
-    def _open_settings(self):
-        dlg = SettingsDialog(self.config, self)
-        dlg.config_changed.connect(self._on_config_changed)
-        dlg.exec()
-
-    def _on_config_changed(self, new_config):
-        self.config = new_config
-        was_running = self.worker and self.worker.isRunning()
-        if was_running:
-            self.worker.stop()
-            self.worker.wait(2000)
-        self._rebuild_cards()
-        if was_running:
-            self.start_monitor()
 
     def show_kline_for_card(self, code, name, mouse_pos):
         """Show kline tooltip instantly from cache (zero latency)"""
@@ -1361,3 +1720,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

@@ -36,6 +36,38 @@ import threading
 SCRIPT_DIR = None
 
 # ============================================================
+# 接口失败跟踪器（连续5次无效返回 → 屏蔽至软件重启）
+# ============================================================
+SOURCE_FAIL_COUNTS = {}      # {source_name: int}  连续失败次数
+SOURCE_DISABLED = set()      # {source_name}        被屏蔽的接口名
+MAX_CONSECUTIVE_FAILS = 5    # 连续失败阈值
+
+def _source_available(name):
+    return name not in SOURCE_DISABLED
+
+def _source_mark_success(name):
+    """接口返回有效数据 → 清零失败计数"""
+    SOURCE_FAIL_COUNTS[name] = 0
+
+def _source_mark_fail(name, detail=''):
+    """接口调用失败/无效 → 计数+1，达阈值则屏蔽"""
+    SOURCE_FAIL_COUNTS[name] = SOURCE_FAIL_COUNTS.get(name, 0) + 1
+    cnt = SOURCE_FAIL_COUNTS[name]
+    print(f'[SourceFail] {name}: 连续失败 {cnt}/{MAX_CONSECUTIVE_FAILS} {detail}')
+    if cnt >= MAX_CONSECUTIVE_FAILS and name not in SOURCE_DISABLED:
+        SOURCE_DISABLED.add(name)
+        print(f'[SourceDisabled] {name} 连续{MAX_CONSECUTIVE_FAILS}次失败，已屏蔽至重启')
+
+def _batch_has_valid_result(results, codes):
+    """判断批量结果是否有效：至少覆盖一半的股票且都有price>0"""
+    if not results:
+        return False
+    valid = sum(1 for c in codes
+                if c in results and results[c].get('price') and results[c].get('price') > 0)
+    return valid >= max(1, len(codes) // 2)
+
+
+# ============================================================
 # TDX节点配置（多节点故障转移）
 # ============================================================
 
@@ -660,8 +692,23 @@ def get_quotes_sina_batch(codes):
             open_price = float(fields[1]) if fields[1] else None
             yest_close = float(fields[2]) if fields[2] else None
             price = float(fields[3]) if fields[3] else None
+            # 盘前/集合竞价阶段 fields[3] 当前价=0，用买1价(fields[6])兜底
+            if price is None or price <= 0:
+                buy1 = float(fields[6]) if len(fields) > 6 and fields[6] else None
+                if buy1 and buy1 > 0:
+                    price = buy1
+            # 再兜底：卖1价 fields[7]
+            if price is None or price <= 0:
+                sell1 = float(fields[7]) if len(fields) > 7 and fields[7] else None
+                if sell1 and sell1 > 0:
+                    price = sell1
             high = float(fields[4]) if fields[4] else None
             low = float(fields[5]) if fields[5] else None
+            # high/low 兜底用 price
+            if (high is None or high <= 0) and price and price > 0:
+                high = price
+            if (low is None or low <= 0) and price and price > 0:
+                low = price
             change_pct = None
             if price is not None and yest_close and yest_close > 0:
                 change_pct = ((price - yest_close) / yest_close) * 100
@@ -677,6 +724,180 @@ def get_quotes_sina_batch(codes):
             }
         except (ValueError, IndexError):
             continue
+    return results
+
+
+def get_quotes_tencent_sqt_batch(codes):
+    """腾讯备用接口批量获取行情（第四数据源）- web.sqt.gtimg.cn
+    独立域名，与 qt.gtimg.cn 分开算频率。返回格式完全一致。
+    支持 A股/港股/美股，解析逻辑与 get_quotes_tencent_batch 相同。
+    """
+    import urllib.request
+    import re
+
+    normalized = []
+    for code in codes:
+        c = code.lower()
+        if not c.startswith(('sh', 'sz', 'hk', 'us', 's_sh', 's_sz', 's_hk', 's_us')):
+            if code.isalpha():
+                normalized.append('us' + code)
+            else:
+                normalized.append(code)
+        else:
+            normalized.append(code)
+
+    codes_str = ','.join(normalized)
+    url = f'https://web.sqt.gtimg.cn/q={codes_str}'
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            content = resp.read().decode('gbk')
+    except Exception as e:
+        print(f'[TencentSQT Batch] failed: {e}')
+        return {}
+
+    results = {}
+    pattern = r'v_[^=]+="([^"]*)"'
+    matches = re.findall(pattern, content)
+
+    code_map = {}
+    for i, code in enumerate(codes):
+        code_map[code] = normalized[i]
+
+    for match_str in matches:
+        f = match_str.split('~')
+        if len(f) < 5:
+            continue
+        ret_code = f[2] if len(f) > 2 else ''
+        is_us = ret_code.lower().startswith('us') or any(
+            n.lower().startswith('us') and n.upper().endswith(ret_code.upper())
+            for n in normalized
+        )
+        if is_us and len(f) < 10:
+            def _safe_float(idx, parts=f):
+                try:
+                    return float(parts[idx]) if idx < len(parts) and parts[idx] not in ('', '0.00') else None
+                except (ValueError, IndexError):
+                    return None
+            price = _safe_float(3)
+            prev_close = _safe_float(4)
+            change_pct = _safe_float(32) if len(f) > 32 else None
+            if change_pct is None and price and prev_close and prev_close > 0:
+                change_pct = ((price - prev_close) / prev_close) * 100
+            quote = {
+                'name': f[1] if len(f) > 1 else ret_code,
+                'code': ret_code,
+                'price': price,
+                'yest_close': prev_close,
+                'open': _safe_float(5),
+                'high': _safe_float(33) if len(f) > 33 else None,
+                'low': _safe_float(34) if len(f) > 34 else None,
+                'change_pct': change_pct,
+            }
+        else:
+            try:
+                quote = {
+                    'name': f[1],
+                    'code': f[2],
+                    'price': float(f[3]) if f[3] else None,
+                    'yest_close': float(f[4]) if f[4] else None,
+                    'open': float(f[5]) if len(f) > 5 and f[5] else None,
+                    'high': float(f[33]) if len(f) > 33 and f[33] else None,
+                    'low': float(f[34]) if len(f) > 34 and f[34] else None,
+                    'change_pct': float(f[32]) if len(f) > 32 and f[32] else None,
+                }
+            except (ValueError, IndexError):
+                continue
+        matched = False
+        for orig_code, norm_code in code_map.items():
+            if orig_code not in results:
+                if norm_code == ret_code or norm_code.upper().endswith(ret_code.upper()):
+                    if quote.get('price') is not None:
+                        results[orig_code] = quote
+                        matched = True
+                        break
+        if not matched and ret_code:
+            for orig_code in codes:
+                if orig_code not in results:
+                    results[orig_code] = quote
+                    break
+    return results
+
+
+def get_quotes_eastmoney_his_batch(codes):
+    """东方财富历史接口批量获取A股行情（第五数据源）- push2his.eastmoney.com
+    ulist批量端点字段含义错误（返回市值），改为循环调用 stock/get 单只端点。
+    整数价存储，需 ÷100。secid 格式：1.code(沪) / 0.code(深)
+    字段：f43=最新价*100  f44=最高*100  f45=最低*100  f46=今开*100  f58=名称  f60=昨收*100  f170=涨跌幅*100
+    """
+    import urllib.request
+    import json as _json
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    secid_map = {}  # secid -> orig_code
+    for code in codes:
+        c = code.lower()
+        if c.startswith('sh'):
+            secid_map[f'1.{c[2:]}'] = code
+        elif c.startswith('sz'):
+            secid_map[f'0.{c[2:]}'] = code
+    if not secid_map:
+        return {}
+
+    ETF_PREFIXES = ('sh51', 'sz15', 'sz16', 'sh50', 'sh58')
+
+    def _scale_for(code_lower):
+        """ETF/基金价格需3位小数用×1000存储，其他股票2位小数用×100"""
+        return 1000 if code_lower.startswith(ETF_PREFIXES) else 100
+
+    def _f(v, scale):
+        if v is None or v == '-' or v == '':
+            return None
+        try:
+            return float(v) / scale
+        except (ValueError, TypeError):
+            return None
+
+    def _fetch_one(secid):
+        url = (
+            f'http://push2his.eastmoney.com/api/qt/stock/get'
+            f'?secid={secid}&fields=f43,f44,f45,f46,f58,f60,f170'
+        )
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0',
+            'Referer': 'https://quote.eastmoney.com/'
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = _json.loads(resp.read().decode('utf-8'))
+            d = data.get('data') or {}
+            if not d:
+                return secid, None
+            return secid, d
+        except Exception:
+            return secid, None
+
+    results = {}
+    secids = list(secid_map.keys())
+    with ThreadPoolExecutor(max_workers=min(6, len(secids))) as ex:
+        for secid, d in ex.map(_fetch_one, secids):
+            if not d:
+                continue
+            orig_code = secid_map[secid]
+            scale = _scale_for(orig_code.lower())
+            price = _f(d.get('f43'), scale)
+            if price is None or price <= 0:
+                continue
+            results[orig_code] = {
+                'name': d.get('f58', orig_code),
+                'code': orig_code,
+                'price': price,
+                'yest_close': _f(d.get('f60'), scale),
+                'open': _f(d.get('f46'), scale),
+                'high': _f(d.get('f44'), scale),
+                'low': _f(d.get('f45'), scale),
+                'change_pct': _f(d.get('f170'), 100),  # 涨跌幅统一 ÷100
+            }
     return results
 
 
@@ -736,7 +957,7 @@ def get_quotes_eastmoney_batch(codes):
         prefix = 'sh' if market == 1 else 'sz'
         orig_code = f'{prefix}{secid}'
         price = _safe_float(item.get('f2'))
-        if price is None:
+        if price is None or price <= 0:
             continue
         results[orig_code] = {
             'name': item.get('f14', orig_code),
@@ -806,26 +1027,49 @@ def get_quotes_batch(codes, source='auto', host=None):
 
     results = {}
 
-    # A股：三源轮询（腾讯/新浪/东方财富），避免单一接口限流
+    # A股：五源轮询（腾讯主/新浪/东方财富行情/腾讯备用/东方财富历史），避免单一接口限流
     if a_share_codes:
-        a_sources = ['tencent', 'sina', 'eastmoney']
+        a_sources = ['tencent', 'sina', 'eastmoney', 'tencent_sqt', 'eastmoney_his']
+        source_funcs = {
+            'tencent':        get_quotes_tencent_batch,
+            'sina':           get_quotes_sina_batch,
+            'eastmoney':      get_quotes_eastmoney_batch,
+            'tencent_sqt':    get_quotes_tencent_sqt_batch,
+            'eastmoney_his':  get_quotes_eastmoney_his_batch,
+        }
+        # 过滤已屏蔽的接口，优先使用可用源
+        available_sources = [s for s in a_sources if _source_available(s)]
+        if not available_sources:
+            # 极端情况：所有源都被屏蔽了，还是退化为全量轮询避免死锁
+            available_sources = a_sources
         idx = getattr(get_quotes_batch, '_a_share_idx', 0)
-        cur_source = a_sources[idx % len(a_sources)]
-        get_quotes_batch._a_share_idx = (idx + 1) % len(a_sources)
+        cur_source = available_sources[idx % len(available_sources)]
+        get_quotes_batch._a_share_idx = (idx + 1) % len(available_sources)
 
         batch_results = {}
-        if cur_source == 'tencent':
-            batch_results = get_quotes_tencent_batch(a_share_codes)
-        elif cur_source == 'sina':
-            batch_results = get_quotes_sina_batch(a_share_codes)
-        elif cur_source == 'eastmoney':
-            batch_results = get_quotes_eastmoney_batch(a_share_codes)
+        func = source_funcs[cur_source]
+        try:
+            batch_results = func(a_share_codes)
+        except Exception as e:
+            print(f'[Source] {cur_source} 调用异常: {e}')
+            batch_results = {}
 
-        # 当前源获取不全的，用腾讯补充
+        # 成功/失败判定
+        if _batch_has_valid_result(batch_results, a_share_codes):
+            _source_mark_success(cur_source)
+        else:
+            _source_mark_fail(cur_source, f'(结果: {len(batch_results)}/{len(a_share_codes)})')
+
+        # 当前源获取不全的，优先用腾讯补充（腾讯作为兜底基准）
         missing = [c for c in a_share_codes
-                   if c not in batch_results or batch_results[c].get('price') is None]
+                   if c not in batch_results
+                   or not batch_results[c].get('price')
+                   or batch_results[c].get('price') <= 0]
         if missing:
-            tencent_fill = get_quotes_tencent_batch(missing)
+            try:
+                tencent_fill = get_quotes_tencent_batch(missing)
+            except Exception:
+                tencent_fill = {}
             for c in missing:
                 if c in tencent_fill and tencent_fill[c].get('price') is not None:
                     batch_results[c] = tencent_fill[c]
