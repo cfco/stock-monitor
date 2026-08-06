@@ -500,6 +500,13 @@ class KlineTooltip(QWidget):
         self.klines = klines
         self.update()
 
+    def _price_fmt(self, price):
+        """根据代码返回格式化后的价格字符串（ETF/基金3位小数，其他2位）"""
+        code = self.code.lower()
+        if code.startswith(('sh51', 'sz15', 'sz16', 'sh50', 'sh58')):
+            return f'{price:.3f}'
+        return f'{price:.2f}'
+
     @property
     def size_key(self):
         w, h = self.width(), self.height()
@@ -531,7 +538,7 @@ class KlineTooltip(QWidget):
         first = self.klines[0]
         p.setPen(QColor(get_color('text')))
         p.setFont(QFont('Microsoft YaHei UI', 9, QFont.Bold))
-        title = f'{self.name}  {self.code}  {last["close"]:.2f}'
+        title = f'{self.name}  {self.code}  {self._price_fmt(last["close"])}'
         p.drawText(10, 16, title)
 
         # 涨跌幅
@@ -592,8 +599,8 @@ class KlineTooltip(QWidget):
         # 价格标注
         p.setPen(QColor(get_color('text_dim')))
         p.setFont(QFont('Microsoft YaHei UI', 7))
-        p.drawText(x0 + 2, y0 + 8, f'{max_price:.2f}')
-        p.drawText(x0 + 2, y0 + h, f'{min_price:.2f}')
+        p.drawText(x0 + 2, y0 + 8, self._price_fmt(max_price))
+        p.drawText(x0 + 2, y0 + h, self._price_fmt(min_price))
 
         # 时间标注
         if n > 0:

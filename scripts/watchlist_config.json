@@ -91,7 +91,7 @@
       "note": ""
     }
   ],
-  "interval": 2,
+  "interval": 3,
   "source": "auto",
   "kline_size": "large",
   "theme": "auto"
