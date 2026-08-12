@@ -1,4 +1,4 @@
-{
+﻿{
   "alerts": [
     {
       "code": "sh000001",
@@ -23,7 +23,7 @@
     {
       "code": "sh510210",
       "name": "上证指数ETF富国",
-      "target": 1.0,
+      "target": null,
       "dir": "above",
       "target_pct": null,
       "pct_dir": "both",
@@ -94,5 +94,6 @@
   "interval": 3,
   "source": "auto",
   "kline_size": "large",
-  "theme": "auto"
+  "theme": "auto",
+  "tdx_nodes": null
 }

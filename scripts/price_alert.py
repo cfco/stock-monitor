@@ -72,13 +72,17 @@ def _batch_has_valid_result(results, codes):
 # ============================================================
 
 # 节点列表（按优先级排序，老板优选低延迟节点）
-TDX_NODES = [
+# 默认 TDX节点列表(可通过 watchlist_config.json 的 tdx_nodes 字段覆盖)
+DEFAULT_TDX_NODES = [
     {'id': 'zhengzhou_z1', 'name': '云行情郑州主站Z1', 'host': '182.118.8.4:7709', 'priority': 1},
-    {'id': 'shanghai_z1', 'name': '云行情上海主站Z1', 'host': '114.141.177.44:7709', 'priority': 2},
-    {'id': 'beijing_z1', 'name': '云行情北京主站Z1', 'host': '123.125.108.103:7709', 'priority': 3},
+    {'id': 'shanghai_z1',  'name': '云行情上海主站Z1', 'host': '114.141.177.44:7709', 'priority': 2},
+    {'id': 'beijing_z1',   'name': '云行情北京主站Z1', 'host': '123.125.108.103:7709', 'priority': 3},
 ]
 
-# 默认节点（郑州主站，延迟最低）
+# 运行时TDX节点列表(可被配置覆盖)
+TDX_NODES = DEFAULT_TDX_NODES
+
+# 默认节点(郑州主站,延迟最低)
 DEFAULT_TDX_HOST = '182.118.8.4:7709'
 DEFAULT_TDX_NODE_NAME = '云行情郑州主站Z1'
 
@@ -88,9 +92,12 @@ _current_node = None
 _failed_nodes = set()
 
 
-def get_tdx_client(host=None):
-    """获取或创建eltdx客户端（单例，连接复用，支持故障转移）"""
-    global _tdx_client, _current_node
+def get_tdx_client(host=None, nodes=None):
+    """获取或创建eltdx客户端(单例,连接复用,支持故障转移)"""
+    global _tdx_client, _current_node, TDX_NODES
+
+    if nodes is not None:
+        TDX_NODES = nodes
 
     # 如果指定了host且当前连接不是该host，重新连接
     if host and _current_node != host:
@@ -921,9 +928,8 @@ def get_quotes_eastmoney_batch(codes):
         return {}
 
     secids_str = ','.join(secids)
-    # fltt=2 返回浮点价格；用 http 避免 https 握手被拒
     url = (
-        f'http://push2.eastmoney.com/api/qt/ulist.np/get'
+        f'https://push2.eastmoney.com/api/qt/ulist.np/get'
         f'?fltt=2&fields=f2,f3,f12,f13,f14,f15,f16,f17,f18'
         f'&secids={secids_str}'
     )
@@ -1177,7 +1183,7 @@ def _get_kline_eastmoney(code, count=60, period='1min'):
         return []
 
     url = (
-        f'http://push2his.eastmoney.com/api/qt/stock/kline/get'
+        f'https://push2his.eastmoney.com/api/qt/stock/kline/get'
         f'?secid={secid}&klt={klt}&fqt=1&end=20500101&lmt={count}'
         f'&fields1=f1,f2,f3,f5,f6'
         f'&fields2=f51,f52,f53,f54,f55,f56'

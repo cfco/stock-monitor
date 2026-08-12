@@ -14,7 +14,7 @@ if not exist ".venv\Scripts\python.exe" (
         uv sync
     ) else (
         python -m venv .venv
-        .venv\Scripts\pip install --quiet PySide6 eltdx
+        .venv\Scripts\pip install --quiet PySide6-Essentials eltdx
     )
     if errorlevel 1 (
         echo [ERROR] Setup failed. Please run manually.

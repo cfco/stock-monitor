@@ -16,21 +16,19 @@ import threading
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'scripts'))
 from price_alert import get_quote, detect_market, close_tdx_client, get_quotes_batch, get_kline_1min
 
-# 调试日志（空实现，避免修改所有调用处）
-def _log(msg):
-    pass
-
 from PySide6.QtCore import Qt, QThread, Signal, QPoint, QRect, QTimer, QSize
 from PySide6.QtGui import (
     QFont, QColor, QPalette, QIcon, QPainter, QBrush, QPen,
-    QMouseEvent, QPaintEvent, QAction, QIntValidator, QDoubleValidator, QCursor
+    QMouseEvent, QPaintEvent, QAction, QIntValidator, QDoubleValidator, QCursor,
+    QPixmap,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
     QPushButton, QFrame, QGraphicsDropShadowEffect, QScrollArea,
     QMessageBox, QSizePolicy,
     QDialog, QLineEdit, QComboBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QFormLayout, QGroupBox, QSpinBox
+    QHeaderView, QFormLayout, QGroupBox, QSpinBox,
+    QSystemTrayIcon, QMenu,
 )
 
 # ============================================================
@@ -116,7 +114,14 @@ PCT_DIR_VALUES = {'跌': 'below', '涨': 'above', '双向': 'both'}
 def load_config():
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8-sig') as f:
-            return json.load(f)
+            config = json.load(f)
+        # 处理TDX节点配置
+        custom_nodes = config.get('tdx_nodes')
+        if custom_nodes and isinstance(custom_nodes, list):
+            import price_alert
+            price_alert.TDX_NODES = custom_nodes
+            price_alert.DEFAULT_TDX_HOST = custom_nodes[0]['host']
+        return config
     except Exception as e:
         print(f'Error loading config: {e}')
         return {'interval': 5, 'source': 'auto', 'alerts': [], 'theme': 'auto'}
@@ -124,7 +129,7 @@ def load_config():
 
 def save_config(config):
     try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        with open(CONFIG_FILE, 'w', encoding='utf-8-sig') as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
         return True
     except Exception as e:
@@ -979,7 +984,6 @@ class _StockResolveThread(QThread):
         self.input_text = input_text
 
     def run(self):
-        _log(f'[Thread] run() 开始, input="{self.input_text}"')
         candidates = []
         try:
             from price_alert import get_quote_tencent
@@ -1029,11 +1033,9 @@ class _StockResolveThread(QThread):
                         candidates = [(full_code, '')]
                 except Exception:
                     candidates = [(full_code, '')]
-
-            _log(f'[Thread] run() 完成, candidates={candidates}')
         except Exception as e:
             import traceback
-            _log(f'[Thread] run() 异常: {e}\n{traceback.format_exc()}')
+            print(f'[StockResolveThread] error: {e}\n{traceback.format_exc()}')
 
         self.finished_resolve.emit(candidates)
 
@@ -1053,7 +1055,6 @@ class SettingsDialog(QDialog):
         self.table.cellChanged.connect(self._on_code_changed)
         self._block_signals = False  # 防止信号循环
         self._resolve_thread = None  # 异步查询线程引用
-        _log('[SettingsDialog] 初始化完成, cellChanged已连接')
 
     def _build_ui(self):
         self.setWindowTitle('监控设置')
@@ -1119,6 +1120,10 @@ class SettingsDialog(QDialog):
         self.theme_combo.addItems(['auto', 'dark', 'light'])
         self.theme_combo.setCurrentText(self.config.get('theme', 'auto'))
         top_form.addRow('主题:', self.theme_combo)
+        self.tdx_host_edit = QLineEdit()
+        self.tdx_host_edit.setText(self.config.get('tdx_host', ''))
+        self.tdx_host_edit.setPlaceholderText('留空使用默认节点')
+        top_form.addRow('TDX服务器:', self.tdx_host_edit)
         layout.addWidget(top_box)
 
         # 表格
@@ -1286,8 +1291,7 @@ class SettingsDialog(QDialog):
         self.table.removeRow(row)
 
     def _on_code_changed(self, row, col):
-        """代码单元格变化时，启动异步线程搜索名称（避免阻塞UI）"""
-        _log(f'[cellChanged] row={row}, col={col}, block={self._block_signals}, loading={getattr(self, "_loading", False)}')
+        """代码单元格变化时,启动异步线程搜索名称(避免阻塞UI)"""
         if self._block_signals or getattr(self, '_loading', False):
             return
         if col != 0:  # 只处理代码列
@@ -1297,13 +1301,11 @@ class SettingsDialog(QDialog):
         if not item:
             return
         code = item.text().strip()
-        _log(f'[cellChanged] code="{code}"')
         if not code:
             return
 
         # 已带前缀的不再重复查询
         if code.lower().startswith(('sh', 'sz', 'hk', 'us', 'bj')):
-            _log(f'[cellChanged] 已带前缀，跳过')
             return
 
         name_item = self.table.item(row, 1)
@@ -1320,35 +1322,29 @@ class SettingsDialog(QDialog):
         self._resolve_thread._name_item = name_item
         self._resolve_thread.finished_resolve.connect(self._on_resolve_done)
         self._resolve_thread.start()
-        _log(f'[cellChanged] 线程已启动')
 
     def _on_resolve_done(self, candidates):
-        """异步查询完成回调（在主线程执行）"""
-        _log(f'[resolve_done] candidates={candidates}')
+        """异步查询完成回调(在主线程执行)"""
         if not candidates:
             return
 
         item = getattr(self._resolve_thread, '_item', None)
         name_item = getattr(self._resolve_thread, '_name_item', None)
-        _log(f'[resolve_done] item={item is not None}, name_item={name_item is not None}')
         if item is None:
             return
 
         chosen = None
         if len(candidates) == 1:
             chosen = candidates[0]
-            _log(f'[resolve_done] 单候选, chosen={chosen}')
         else:
             # 多个候选，弹窗选择
             labels = [f'{c[0]}  {c[1]}' for c in candidates]
-            _log(f'[resolve_done] 多候选={len(candidates)}, 即将弹窗: {labels}')
             from PySide6.QtWidgets import QInputDialog
             sel, ok = QInputDialog.getItem(
                 self, '选择股票',
                 f'匹配到以下 {len(candidates)} 只股票，请选择：',
                 labels, 0, False
             )
-            _log(f'[resolve_done] 弹窗结果: ok={ok}, sel={sel}')
             if ok and sel:
                 chosen = candidates[labels.index(sel)]
 
@@ -1358,7 +1354,6 @@ class SettingsDialog(QDialog):
             if name_item:
                 name_item.setText(chosen[1] or '')
             self._block_signals = False
-            _log(f'[resolve_done] 已填充: code={chosen[0]}, name={chosen[1]}')
 
     def _save_and_close(self):
         alerts = []
@@ -1437,6 +1432,10 @@ class FloatingWindow(QWidget):
         self._kline_tooltip = None
         self._kline_fetcher = None
         self._settings_dialog = None
+
+        # 系统托盘
+        self._tray_icon = None
+        self._build_tray_icon()
 
         # 初始化主题
         self._theme_mode = self.config.get('theme', 'auto')
@@ -1588,6 +1587,48 @@ class FloatingWindow(QWidget):
         if event.button() == Qt.LeftButton:
             QApplication.quit()
 
+    def _build_tray_icon(self):
+        """创建系统托盘图标"""
+        pixmap = self._create_tray_pixmap()
+        self._tray_icon = QSystemTrayIcon(QIcon(pixmap), self)
+        self._tray_icon.setToolTip('Stock Monitor')
+        self._tray_icon.activated.connect(self._on_tray_activated)
+
+        menu = QMenu()
+        show_action = QAction('显示悬浮窗', menu)
+        show_action.triggered.connect(self.show)
+        quit_action = QAction('退出', menu)
+        quit_action.triggered.connect(QApplication.quit)
+        menu.addAction(show_action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+        self._tray_icon.setContextMenu(menu)
+        self._tray_icon.show()
+
+    def _create_tray_pixmap(self):
+        """创建托盘图标: 红色圆形+白色上涨箭头"""
+        size = 64
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor('#e74c3c'))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(4, 4, size - 8, size - 8)
+        painter.setPen(QPen(QColor('#ffffff'), 3))
+        painter.drawLine(32, 44, 32, 20)
+        painter.drawLine(24, 28, 32, 20)
+        painter.drawLine(40, 28, 32, 20)
+        painter.end()
+        return pixmap
+
+    def _on_tray_activated(self, reason):
+        """点击托盘图标显示窗口"""
+        if reason == QSystemTrayIcon.Trigger:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
     def _move_to_bottom_right(self):
         screen = QApplication.primaryScreen().availableGeometry()
         w, h = self.width() or 140, self.height() or 400
@@ -1724,6 +1765,14 @@ class FloatingWindow(QWidget):
         if self.worker and self.worker.isRunning():
             return
         self.config = load_config()
+        # 应用TDX自定义节点配置
+        tdx_host = self.config.get('tdx_host', '')
+        if tdx_host:
+            import price_alert
+            price_alert.TDX_NODES = [
+                {'id': 'custom', 'name': f'自定义({tdx_host})', 'host': tdx_host, 'priority': 1}
+            ]
+            price_alert.DEFAULT_TDX_HOST = tdx_host
         self._rebuild_cards()
         self.worker = QuoteWorker(self.config)
         self.worker.quote_updated.connect(self.on_quote)
@@ -1809,7 +1858,20 @@ class FloatingWindow(QWidget):
             card.set_data(data)
 
     def on_alert(self, data):
-        pass  # 预警仅触发卡片变色，不再弹通知
+        """预警触发时显示系统托盘通知并唤醒窗口"""
+        name = data.get('name', '')
+        message = data.get('message', '')
+        price = data.get('price', 0)
+        if self._tray_icon and self._tray_icon.isSystemTrayAvailable():
+            self._tray_icon.showMessage(
+                f'{name} 预警触发',
+                f'{message} | 当前价: {price:.2f}',
+                QSystemTrayIcon.Warning,
+                5000,
+            )
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
     def on_status(self, status):
         if status == 'running':
