@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+
+# IDE
+.idea/
+.trae/
+.kilo/
+.vscode/
+
+# 运行产物
+reports/
+*.log

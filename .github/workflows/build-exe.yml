@@ -1,0 +1,59 @@
+name: Build Windows EXE
+
+# 推 tag（如 v5.2.0）自动构建并发布 Release；也可在 Actions 页面手动触发
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PySide6-Essentials eltdx pyinstaller
+
+      - name: Build single-file exe
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed --name StockMonitor --paths scripts --hidden-import price_alert --add-data "scripts/watchlist_config.json;scripts" --exclude-module PySide6.QtWebEngineCore --exclude-module PySide6.QtWebEngineWidgets --exclude-module PySide6.QtWebEngineQuick --exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick --exclude-module PySide6.QtQuick3D --exclude-module PySide6.Qt3DCore --exclude-module PySide6.Qt3DRender --exclude-module PySide6.QtMultimedia --exclude-module PySide6.QtCharts --exclude-module PySide6.QtDataVisualization --exclude-module tkinter floating_window.py
+
+      - name: Smoke test (exe 能起来吗)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\StockMonitor.exe" -PassThru
+          Start-Sleep -Seconds 12
+          if ($p.HasExited) {
+            Write-Error "exe 启动后即退出（退出码 $($p.ExitCode)），构建产物不可用"
+            exit 1
+          }
+          Write-Host "exe 已稳定运行 12 秒，判定启动正常"
+          Stop-Process -Id $p.Id -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StockMonitor-exe
+          path: dist/StockMonitor.exe
+          if-no-files-found: error
+
+      - name: Publish Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/StockMonitor.exe
+          generate_release_notes: true

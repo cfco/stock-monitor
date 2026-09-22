@@ -89,6 +89,16 @@
       "pct_dir": "both",
       "position": "",
       "note": ""
+    },
+    {
+      "code": "sh601091",
+      "name": "C沈鼓",
+      "target": null,
+      "dir": "below",
+      "target_pct": null,
+      "pct_dir": "both",
+      "position": "",
+      "note": ""
     }
   ],
   "interval": 3,

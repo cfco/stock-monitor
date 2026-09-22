@@ -42,28 +42,57 @@ SOURCE_FAIL_COUNTS = {}      # {source_name: int}  连续失败次数
 SOURCE_DISABLED = set()      # {source_name}        被屏蔽的接口名
 MAX_CONSECUTIVE_FAILS = 5    # 连续失败阈值
 
+# 为什么要加锁：计数是「读-改-写」，非原子操作。get_quotes_batch 既会被 QuoteWorker
+# 后台线程调用、也可能被 UI 线程（设置保存后）调用，并发下会丢计数，导致屏蔽判定失真。
+# 锁内只做内存操作，print 放到锁外，避免持锁做 IO。
+_SOURCE_LOCK = threading.Lock()
+
+# A股多源轮询游标：原先藏在 get_quotes_batch 的函数属性里（getattr/setattr），
+# 读-改-写非原子、并发调用会跳号。改为模块级变量 + 专用锁。
+_a_share_cursor = 0
+_a_share_cursor_lock = threading.Lock()
+
 def _source_available(name):
-    return name not in SOURCE_DISABLED
+    with _SOURCE_LOCK:
+        return name not in SOURCE_DISABLED
 
 def _source_mark_success(name):
     """接口返回有效数据 → 清零失败计数"""
-    SOURCE_FAIL_COUNTS[name] = 0
+    with _SOURCE_LOCK:
+        SOURCE_FAIL_COUNTS[name] = 0
 
 def _source_mark_fail(name, detail=''):
     """接口调用失败/无效 → 计数+1，达阈值则屏蔽"""
-    SOURCE_FAIL_COUNTS[name] = SOURCE_FAIL_COUNTS.get(name, 0) + 1
-    cnt = SOURCE_FAIL_COUNTS[name]
+    with _SOURCE_LOCK:
+        SOURCE_FAIL_COUNTS[name] = SOURCE_FAIL_COUNTS.get(name, 0) + 1
+        cnt = SOURCE_FAIL_COUNTS[name]
     print(f'[SourceFail] {name}: 连续失败 {cnt}/{MAX_CONSECUTIVE_FAILS} {detail}')
-    if cnt >= MAX_CONSECUTIVE_FAILS and name not in SOURCE_DISABLED:
-        SOURCE_DISABLED.add(name)
-        print(f'[SourceDisabled] {name} 连续{MAX_CONSECUTIVE_FAILS}次失败，已屏蔽至重启')
+    if cnt >= MAX_CONSECUTIVE_FAILS:
+        with _SOURCE_LOCK:
+            newly = name not in SOURCE_DISABLED
+            if newly:
+                SOURCE_DISABLED.add(name)
+        if newly:
+            print(f'[SourceDisabled] {name} 连续{MAX_CONSECUTIVE_FAILS}次失败，已屏蔽至重启')
 
 def _batch_has_valid_result(results, codes):
-    """判断批量结果是否有效：至少覆盖一半的股票且都有price>0"""
+    """判断批量结果是否有效：至少覆盖一半的股票，且价格与涨跌幅都齐全
+
+    为什么要连 change_pct 一起查：只查 price>0 时，涨跌幅缺失的脏数据也会被判成
+    「该源可用」，源不会被屏蔽、坏数据继续上屏，而涨跌幅预警恰恰依赖这个字段。
+    """
     if not results:
         return False
-    valid = sum(1 for c in codes
-                if c in results and results[c].get('price') and results[c].get('price') > 0)
+
+    def _usable(rec):
+        """单条记录能否用于预警：价格为正且涨跌幅存在"""
+        try:
+            price = rec.get('price')
+            return price is not None and float(price) > 0 and rec.get('change_pct') is not None
+        except (TypeError, ValueError):
+            return False
+
+    valid = sum(1 for c in codes if c in results and _usable(results[c]))
     return valid >= max(1, len(codes) // 2)
 
 
@@ -114,13 +143,19 @@ def get_tdx_client(host=None, nodes=None):
         _current_node = host
         return _tdx_client
 
-    # 否则按优先级选择节点
-    for node in TDX_NODES:
-        if node['host'] in _failed_nodes:
-            continue
+    # 否则按优先级选择节点。
+    # 失败过的节点不永久跳过、只排到队尾：原先直接 continue 会让「临时挂过、
+    # 后来恢复」的节点在程序重启前永不可用；排到队尾既避开它的重试开销，
+    # 又保留自动恢复能力。
+    ordered = sorted(
+        TDX_NODES,
+        key=lambda n: (n['host'] in _failed_nodes, n.get('priority', 99)),
+    )
+    for node in ordered:
         try:
             _tdx_client = Client(host=node['host'])
             _current_node = node['host']
+            _failed_nodes.discard(node['host'])   # 连上即撤销失败标记
             print(f'[TDX] Connected to {node["name"]} ({node["host"]})')
             return _tdx_client
         except Exception as e:
@@ -226,57 +261,21 @@ def get_quote_tdx(code, host=None):
 
 
 def get_quote_tencent(code):
-    """从腾讯接口获取实时行情（备用，~155ms延迟）
-    支持 A股(sh/sz)、港股(hk)、美股(us)。
-    注意：美股返回字段顺序与A股不同，本函数自动适配。
+    """从腾讯接口获取 A 股实时行情（备用，约 155ms 延迟）
+
+    仅支持 A 股（sh/sz 前缀）；非 A 股代码直接抛错，
+    避免上层拿到结构不符的脏数据。
     """
     import urllib.request
-    # 美股代码统一加 us 前缀（兼容用户写 usAAPL 或直接 AAPL）
-    if not code.lower().startswith(('sh', 'sz', 'hk', 'us', 's_sh', 's_sz', 's_hk', 's_us')):
-        # 字母代码默认视为美股
-        if code.isalpha():
-            code = 'us' + code
+    if not code.lower().startswith(('sh', 'sz')):
+        raise ValueError(f'腾讯接口仅支持 A 股代码(sh/sz): {code}')
+
     url = f'https://qt.gtimg.cn/q={code}'
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(req, timeout=5) as resp:
         content = resp.read().decode('gbk')
 
-    # 美股返回格式与A股不同：字段数少，无~分隔的完整结构
-    # 格式示例：v_usAAPL="100~Apple~AAPL~170.50~169.30~171.00~..."; 末尾有涨跌幅等
-    is_us = code.lower().startswith('us') or code.lower().startswith('s_us')
     f = content.split('~')
-
-    if is_us and len(f) < 10:
-        # 美股精简格式，尝试正则提取
-        import re
-        m = re.search(r'"([^"]+)"', content)
-        if not m:
-            raise ValueError(f'腾讯接口返回格式异常: {content[:100]}')
-        parts = m.group(1).split('~')
-        # 美股典型字段：marketCode~name~symbol~price~prevClose~open~high~low~...~changePct
-        def _safe_float(idx):
-            try:
-                return float(parts[idx]) if idx < len(parts) and parts[idx] not in ('', '0.00') else None
-            except (ValueError, IndexError):
-                return None
-        price = _safe_float(3)
-        prev_close = _safe_float(4)
-        change_pct = _safe_float(32) if len(parts) > 32 else None
-        # 美股涨跌幅可能字段位置不同，如果取不到，用 price/prev_close 计算
-        if change_pct is None and price and prev_close and prev_close > 0:
-            change_pct = ((price - prev_close) / prev_close) * 100
-        return {
-            'name': parts[1] if len(parts) > 1 else code,
-            'code': parts[2] if len(parts) > 2 else code,
-            'price': price,
-            'yest_close': prev_close,
-            'open': _safe_float(5),
-            'high': _safe_float(33) if len(parts) > 33 else None,
-            'low': _safe_float(34) if len(parts) > 34 else None,
-            'change_pct': change_pct,
-        }
-
-    # A股/港股标准格式
     return {
         'name': f[1],
         'code': f[2],
@@ -288,240 +287,43 @@ def get_quote_tencent(code):
         'change_pct': float(f[32]) if len(f) > 32 and f[32] else None,
     }
 
-
-def _detect_trading_session(meta):
-    """根据 Yahoo meta 信息判断当前交易时段
-    返回: 'pre' | 'regular' | 'post' | 'closed'
-    """
-    import time as _time
-    now = _time.time()
-    periods = meta.get('currentTradingPeriod', {})
-    if not periods:
-        return 'closed'
-    # 检查盘前
-    pre = periods.get('pre', {})
-    if pre and pre.get('start') and pre.get('end'):
-        if pre['start'] <= now <= pre['end']:
-            return 'pre'
-    # 检查常规
-    reg = periods.get('regular', {})
-    if reg and reg.get('start') and reg.get('end'):
-        if reg['start'] <= now <= reg['end']:
-            return 'regular'
-    # 检查盘后
-    post = periods.get('post', {})
-    if post and post.get('start') and post.get('end'):
-        if post['start'] <= now <= post['end']:
-            return 'post'
-    return 'closed'
-
-
-def get_quote_yahoo(code):
-    """从 Yahoo Finance 获取实时行情（支持全球市场：韩股/美股/港股/欧股等）
-    韩股代码格式：005930.KS (KOSPI) / 052690.KQ (KOSDAQ)
-    美股代码格式：AAPL / TSLA
-    港股代码格式：0700.HK
-
-    自动识别盘前/盘后交易时段，返回对应价格。
-    """
-    import urllib.request
-    import json as _json
-    # 自动加韩股后缀：kr005930 → 005930.KS
-    symbol = code
-    if code.lower().startswith('kr'):
-        num = code[2:]
-        symbol = f'{num}.KS' if num.startswith('0') and len(num) == 6 else f'{num}.KQ'
-
-    # includePrePost=true 包含盘前盘后数据点
-    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=2m&range=1d&includePrePost=true'
-    req = urllib.request.Request(url, headers={
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    })
-    with urllib.request.urlopen(req, timeout=8) as resp:
-        data = _json.loads(resp.read().decode('utf-8'))
-
-    result = data.get('chart', {}).get('result')
-    if not result:
-        raise ValueError(f'Yahoo接口未返回数据: {symbol}')
-    meta = result[0].get('meta', {})
-    indicators = result[0].get('indicators', {})
-    quotes = indicators.get('quotes', [{}])[0]
-    timestamps = result[0].get('timestamp', [])
-
-    # 检测交易时段，选择最合适的价格
-    session = _detect_trading_session(meta)
-    session_label = {
-        'pre': '盘前', 'regular': '常规', 'post': '盘后', 'closed': '已休市'
-    }.get(session, '')
-
-    # 各时段价格
-    pre_price = meta.get('preMarketPrice')
-    post_price = meta.get('postMarketPrice')
-    reg_price = meta.get('regularMarketPrice')
-
-    # 如果在盘前/盘后但 meta 中没有对应价格，从 chart 数据点中提取
-    if session in ('pre', 'post'):
-        latest_price = _get_latest_chart_price(timestamps, quotes, meta, session)
-        if session == 'pre' and not pre_price:
-            pre_price = latest_price
-        if session == 'post' and not post_price:
-            post_price = latest_price
-        # 如果有盘前盘后价格，优先使用
-        if session == 'pre' and pre_price:
-            price = pre_price
-        elif session == 'post' and post_price:
-            price = post_price
-        else:
-            price = reg_price
-    else:
-        price = reg_price
-
-    prev_close = meta.get('chartPreviousClose') or meta.get('previousClose')
-    change_pct = None
-    if price and prev_close and prev_close > 0:
-        change_pct = ((price - prev_close) / prev_close) * 100
-
-    # 从日内报价数组取 open/high/low
-    opens = quotes.get('open') or []
-    highs = quotes.get('high') or []
-    lows = quotes.get('low') or []
-    valid_open = next((v for v in opens if v is not None), None)
-    valid_high = max([v for v in highs if v is not None], default=None)
-    valid_low = min([v for v in lows if v is not None], default=None)
-
-    week52_high = meta.get('fiftyTwoWeekHigh')
-    week52_low = meta.get('fiftyTwoWeekLow')
-
-    # Parse klines from chart data (already fetched, no extra request)
-    klines = []
-    closes_list = quotes.get('close') or []
-    if timestamps and closes_list:
-        for i in range(len(timestamps)):
-            o = opens[i] if i < len(opens) else None
-            h = highs[i] if i < len(highs) else None
-            l = lows[i] if i < len(lows) else None
-            c = closes_list[i] if i < len(closes_list) else None
-            v = (quotes.get('volume') or [])
-            vol = v[i] if i < len(v) else 0
-            if o is not None and h is not None and l is not None and c is not None:
-                klines.append({
-                    'time': datetime.datetime.fromtimestamp(timestamps[i]).strftime('%H:%M'),
-                    'open': o, 'high': h, 'low': l, 'close': c, 'volume': vol or 0,
-                })
-
-    return {
-        'name': meta.get('symbol', symbol),
-        'code': symbol,
-        'price': price,
-        'yest_close': prev_close,
-        'open': valid_open,
-        'high': valid_high,
-        'low': valid_low,
-        'change_pct': change_pct,
-        'currency': meta.get('currency', ''),
-        'session': session_label,
-        'session_raw': session,
-        'pre_market_price': pre_price,
-        'post_market_price': post_price,
-        'week52_high': week52_high,
-        'week52_low': week52_low,
-        'klines': klines,
-    }
-
-
-def _get_latest_chart_price(timestamps, quotes, meta, target_session):
-    """从 chart 数据点中提取盘前/盘后的最新价格"""
-    closes = quotes.get('close') or []
-    if not timestamps or not closes:
-        return None
-
-    ctp = meta.get('currentTradingPeriod', {})
-    period = ctp.get(target_session, {})
-    if not period:
-        return None
-
-    start = period.get('start', 0)
-    end = period.get('end', 0)
-
-    # 从后往前找在目标时段内的最后一个有效价格
-    for i in range(len(timestamps) - 1, -1, -1):
-        ts = timestamps[i]
-        close = closes[i] if i < len(closes) else None
-        if close is not None and start <= ts <= end:
-            return close
-
-    return None
-
-
 def detect_market(code):
-    """根据代码格式自动识别市场
-    返回: 'a_share' | 'hk' | 'us' | 'kr' | 'yahoo' | 'unknown'
+    """识别是否为 A 股代码（含 s_ 前缀的指数写法）
+
+    返回: 'a_share' | 'unknown'
+
+    为什么保留：UI 与批量取数都要靠它区分「可监控的 A 股」与
+    「不支持的代码」，是单一判定入口。
     """
     c = code.lower()
-    if c.startswith(('sh', 'sz')):
+    if c.startswith(('sh', 'sz', 's_sh', 's_sz')):
         return 'a_share'
-    if c.startswith('hk'):
-        return 'hk'
-    if c.startswith('us') and len(c) > 2 and not c[2:].isdigit():
-        return 'us'
-    if c.startswith('kr'):
-        return 'kr'
-    # 直接 Yahoo 格式（包含点号）：005930.KS / AAPL / 0700.HK
-    if '.' in code:
-        return 'yahoo'
-    # 纯字母视为美股
-    if code.isalpha():
-        return 'us'
     return 'unknown'
 
-
 def get_quote(code, source='auto', host=None):
-    """统一行情获取接口（自动路由）
+    """统一行情获取接口（仅 A 股）
+
     source:
-      auto    - 根据代码格式自动选择（默认）
-      tdx     - 强制通达信协议（仅A股）
-      tencent - 强制腾讯接口（A股/港股/美股）
-      yahoo   - 强制Yahoo Finance（全球市场，推荐韩股）
+      auto    - A股优先通达信（低延迟），失败回退腾讯
+      tdx     - 强制通达信协议
+      tencent - 强制腾讯接口
     """
-    if source == 'tdx':
-        return get_quote_tdx(code, host)
+    # 市场校验必须前置于 source 分支：否则 source='tencent' 会绕过它直接进腾讯接口。
+    # 腾讯那层虽然也会拦，但校验点分散在两处，将来改一处就容易漏掉另一处。
+    if detect_market(code) != 'a_share':
+        raise ValueError(f'仅支持 A 股代码（sh/sz 前缀），收到: {code}')
+
     if source == 'tencent':
         return get_quote_tencent(code)
-    if source == 'yahoo':
-        return get_quote_yahoo(code)
 
-    # auto: 根据市场路由
-    market = detect_market(code)
-    if market == 'a_share':
-        # A股优先 TDX（低延迟），失败回退腾讯
-        try:
-            return get_quote_tdx(code, host)
-        except Exception:
-            return get_quote_tencent(code)
-    if market == 'us':
-        # 美股：盘前/盘后时段优先 Yahoo（支持盘前盘后数据），常规时段用腾讯（更快）
-        try:
-            q_yahoo = get_quote_yahoo(code)
-            session = q_yahoo.get('session_raw', '')
-            if session in ('pre', 'post'):
-                # 盘前/盘后：Yahoo 数据更准确
-                return q_yahoo
-            # 常规交易或休市：用腾讯接口（更快），但如果腾讯失败则用 Yahoo
-            try:
-                return get_quote_tencent(code)
-            except Exception:
-                return q_yahoo
-        except Exception:
-            return get_quote_tencent(code)
-    if market == 'hk':
-        # 港股：腾讯接口即可
+    if source == 'tdx':
+        return get_quote_tdx(code, host)
+
+    # auto: A股优先 TDX（低延迟），失败回退腾讯
+    try:
+        return get_quote_tdx(code, host)
+    except Exception:
         return get_quote_tencent(code)
-    if market in ('kr', 'yahoo'):
-        # 韩股/其他市场：Yahoo Finance
-        return get_quote_yahoo(code)
-    # 未知市场，尝试腾讯
-    return get_quote_tencent(code)
-
 
 def resolve_name(code, source='tdx', host=None):
     """获取股票名称（tdx协议不返回名称，用腾讯接口补充）"""
@@ -536,25 +338,16 @@ def resolve_name(code, source='tdx', host=None):
 
 def get_quotes_tencent_batch(codes):
     """腾讯接口批量获取行情（一次请求多只股票）
-    codes: 代码列表，如 ['sh000001', 'sh601398', 'usKORU']
+    codes: A股代码列表，如 ['sh000001', 'sh601398']
     返回: {code: quote_dict, ...}，失败的代码不包含在结果中
     """
     import urllib.request
     import re
 
-    # 统一美股代码前缀
-    normalized = []
-    for code in codes:
-        c = code.lower()
-        if not c.startswith(('sh', 'sz', 'hk', 'us', 's_sh', 's_sz', 's_hk', 's_us')):
-            if code.isalpha():
-                normalized.append('us' + code)
-            else:
-                normalized.append(code)
-        else:
-            normalized.append(code)
-
-    # 批量请求：逗号分隔，腾讯主站（超时3秒快速失败以便回退到其他源）
+    # 项目已收敛为纯 A 股，代码原样透传
+    # （这里不能过滤：下面 code_map 是按位索引 normalized 的，过滤会错位；
+    #   真正的过滤在 get_quotes_batch 入口完成）
+    normalized = list(codes)
     codes_str = ','.join(normalized)
     url = f'https://qt.gtimg.cn/q={codes_str}'
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -583,49 +376,20 @@ def get_quotes_tencent_batch(codes):
 
         # 提取返回的代码
         ret_code = f[2] if len(f) > 2 else ''
-        # 判断是否美股
-        is_us = ret_code.lower().startswith('us') or any(
-            n.lower().startswith('us') and n.upper().endswith(ret_code.upper())
-            for n in normalized
-        )
-
-        # 美股精简格式
-        if is_us and len(f) < 10:
-            def _safe_float(idx, parts=f):
-                try:
-                    return float(parts[idx]) if idx < len(parts) and parts[idx] not in ('', '0.00') else None
-                except (ValueError, IndexError):
-                    return None
-            price = _safe_float(3)
-            prev_close = _safe_float(4)
-            change_pct = _safe_float(32) if len(f) > 32 else None
-            if change_pct is None and price and prev_close and prev_close > 0:
-                change_pct = ((price - prev_close) / prev_close) * 100
+        # A股标准格式
+        try:
             quote = {
-                'name': f[1] if len(f) > 1 else ret_code,
-                'code': ret_code,
-                'price': price,
-                'yest_close': prev_close,
-                'open': _safe_float(5),
-                'high': _safe_float(33) if len(f) > 33 else None,
-                'low': _safe_float(34) if len(f) > 34 else None,
-                'change_pct': change_pct,
+                'name': f[1],
+                'code': f[2],
+                'price': float(f[3]) if f[3] else None,
+                'yest_close': float(f[4]) if f[4] else None,
+                'open': float(f[5]) if len(f) > 5 and f[5] else None,
+                'high': float(f[33]) if len(f) > 33 and f[33] else None,
+                'low': float(f[34]) if len(f) > 34 and f[34] else None,
+                'change_pct': float(f[32]) if len(f) > 32 and f[32] else None,
             }
-        else:
-            # A股/港股标准格式
-            try:
-                quote = {
-                    'name': f[1],
-                    'code': f[2],
-                    'price': float(f[3]) if f[3] else None,
-                    'yest_close': float(f[4]) if f[4] else None,
-                    'open': float(f[5]) if len(f) > 5 and f[5] else None,
-                    'high': float(f[33]) if len(f) > 33 and f[33] else None,
-                    'low': float(f[34]) if len(f) > 34 and f[34] else None,
-                    'change_pct': float(f[32]) if len(f) > 32 and f[32] else None,
-                }
-            except (ValueError, IndexError) as e:
-                continue
+        except (ValueError, IndexError) as e:
+            continue
 
         # 将结果映射回原始代码
         # 先尝试精确匹配
@@ -649,18 +413,18 @@ def get_quotes_tencent_batch(codes):
 
 
 def get_quotes_sina_batch(codes):
-    """新浪接口批量获取A股/港股行情（第二数据源）
+    """新浪接口批量获取 A 股行情（第二数据源）
     新浪需要 Referer 头，否则返回403。
     返回格式: var hq_str_sh601398="名称,今开,昨收,当前价,最高,最低,...";
     """
     import urllib.request
     import re as _re
 
-    # 新浪支持 A股(sh/sz) 和港股(hk)
+    # 新浪仅取 A 股代码（sh/sz 及 s_ 指数写法）
     sina_codes = []
     for code in codes:
         c = code.lower()
-        if c.startswith(('sh', 'sz', 'hk', 's_sh', 's_sz', 's_hk')):
+        if c.startswith(('sh', 'sz', 's_sh', 's_sz')):
             sina_codes.append(code)
     if not sina_codes:
         return {}
@@ -737,22 +501,15 @@ def get_quotes_sina_batch(codes):
 def get_quotes_tencent_sqt_batch(codes):
     """腾讯备用接口批量获取行情（第四数据源）- web.sqt.gtimg.cn
     独立域名，与 qt.gtimg.cn 分开算频率。返回格式完全一致。
-    支持 A股/港股/美股，解析逻辑与 get_quotes_tencent_batch 相同。
+    仅支持 A 股，解析逻辑与 get_quotes_tencent_batch 相同。
     """
     import urllib.request
     import re
 
-    normalized = []
-    for code in codes:
-        c = code.lower()
-        if not c.startswith(('sh', 'sz', 'hk', 'us', 's_sh', 's_sz', 's_hk', 's_us')):
-            if code.isalpha():
-                normalized.append('us' + code)
-            else:
-                normalized.append(code)
-        else:
-            normalized.append(code)
-
+    # 项目已收敛为纯 A 股，代码原样透传
+    # （这里不能过滤：下面 code_map 是按位索引 normalized 的，过滤会错位；
+    #   真正的过滤在 get_quotes_batch 入口完成）
+    normalized = list(codes)
     codes_str = ','.join(normalized)
     url = f'https://web.sqt.gtimg.cn/q={codes_str}'
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -776,45 +533,19 @@ def get_quotes_tencent_sqt_batch(codes):
         if len(f) < 5:
             continue
         ret_code = f[2] if len(f) > 2 else ''
-        is_us = ret_code.lower().startswith('us') or any(
-            n.lower().startswith('us') and n.upper().endswith(ret_code.upper())
-            for n in normalized
-        )
-        if is_us and len(f) < 10:
-            def _safe_float(idx, parts=f):
-                try:
-                    return float(parts[idx]) if idx < len(parts) and parts[idx] not in ('', '0.00') else None
-                except (ValueError, IndexError):
-                    return None
-            price = _safe_float(3)
-            prev_close = _safe_float(4)
-            change_pct = _safe_float(32) if len(f) > 32 else None
-            if change_pct is None and price and prev_close and prev_close > 0:
-                change_pct = ((price - prev_close) / prev_close) * 100
+        try:
             quote = {
-                'name': f[1] if len(f) > 1 else ret_code,
-                'code': ret_code,
-                'price': price,
-                'yest_close': prev_close,
-                'open': _safe_float(5),
-                'high': _safe_float(33) if len(f) > 33 else None,
-                'low': _safe_float(34) if len(f) > 34 else None,
-                'change_pct': change_pct,
+                'name': f[1],
+                'code': f[2],
+                'price': float(f[3]) if f[3] else None,
+                'yest_close': float(f[4]) if f[4] else None,
+                'open': float(f[5]) if len(f) > 5 and f[5] else None,
+                'high': float(f[33]) if len(f) > 33 and f[33] else None,
+                'low': float(f[34]) if len(f) > 34 and f[34] else None,
+                'change_pct': float(f[32]) if len(f) > 32 and f[32] else None,
             }
-        else:
-            try:
-                quote = {
-                    'name': f[1],
-                    'code': f[2],
-                    'price': float(f[3]) if f[3] else None,
-                    'yest_close': float(f[4]) if f[4] else None,
-                    'open': float(f[5]) if len(f) > 5 and f[5] else None,
-                    'high': float(f[33]) if len(f) > 33 and f[33] else None,
-                    'low': float(f[34]) if len(f) > 34 and f[34] else None,
-                    'change_pct': float(f[32]) if len(f) > 32 and f[32] else None,
-                }
-            except (ValueError, IndexError):
-                continue
+        except (ValueError, IndexError):
+            continue
         matched = False
         for orig_code, norm_code in code_map.items():
             if orig_code not in results:
@@ -886,7 +617,8 @@ def get_quotes_eastmoney_his_batch(codes):
 
     results = {}
     secids = list(secid_map.keys())
-    with ThreadPoolExecutor(max_workers=min(6, len(secids))) as ex:
+    # 并发压到 3：原先 6 并发同时打同一域名，容易触发东财单 IP 限流
+    with ThreadPoolExecutor(max_workers=min(3, len(secids))) as ex:
         for secid, d in ex.map(_fetch_one, secids):
             if not d:
                 continue
@@ -923,7 +655,7 @@ def get_quotes_eastmoney_batch(codes):
             secids.append(f'1.{c[2:]}')
         elif c.startswith('sz'):
             secids.append(f'0.{c[2:]}')
-        # 东方财富不处理美股/港股
+        # 东方财富仅取 A 股（sh/sz）
     if not secids:
         return {}
 
@@ -979,11 +711,8 @@ def get_quotes_eastmoney_batch(codes):
 
 
 def get_quotes_batch(codes, source='auto', host=None):
-    """统一批量行情获取接口
-    按数据源分组，减少请求次数：
-    - A股/港股：腾讯批量请求（1次）
-    - 美股：Yahoo Finance 并发（N次，但可并发）
-    - 全tdx：批量请求
+    """统一批量行情获取接口（仅 A 股）
+
     返回: {code: quote_dict, ...}
     """
     if not codes:
@@ -1002,34 +731,10 @@ def get_quotes_batch(codes, source='auto', host=None):
                 print(f'[TDX Batch] Error for {code}: {e}')
         return results
 
-    if source == 'yahoo':
-        results = {}
-        for code in codes:
-            try:
-                results[code] = get_quote_yahoo(code)
-            except Exception as e:
-                print(f'[Yahoo Batch] Error for {code}: {e}')
-        return results
-
-    # auto: 按市场分组
-    a_share_codes = []
-    us_codes = []
-    hk_codes = []
-    kr_codes = []
-    other_codes = []
-
-    for code in codes:
-        market = detect_market(code)
-        if market == 'a_share':
-            a_share_codes.append(code)
-        elif market == 'us':
-            us_codes.append(code)
-        elif market == 'hk':
-            hk_codes.append(code)
-        elif market in ('kr', 'yahoo'):
-            kr_codes.append(code)
-        else:
-            other_codes.append(code)
+    # 仅保留 A 股代码；非 A 股一律忽略（项目已收敛为纯 A 股监控）
+    a_share_codes = [c for c in codes if detect_market(c) == 'a_share']
+    if not a_share_codes:
+        return {}
 
     results = {}
 
@@ -1048,9 +753,11 @@ def get_quotes_batch(codes, source='auto', host=None):
         if not available_sources:
             # 极端情况：所有源都被屏蔽了，还是退化为全量轮询避免死锁
             available_sources = a_sources
-        idx = getattr(get_quotes_batch, '_a_share_idx', 0)
+        global _a_share_cursor
+        with _a_share_cursor_lock:
+            idx = _a_share_cursor
+            _a_share_cursor = (idx + 1) % len(available_sources)
         cur_source = available_sources[idx % len(available_sources)]
-        get_quotes_batch._a_share_idx = (idx + 1) % len(available_sources)
 
         batch_results = {}
         func = source_funcs[cur_source]
@@ -1082,85 +789,84 @@ def get_quotes_batch(codes, source='auto', host=None):
 
         results.update(batch_results)
 
-    # 港股：腾讯批量
-    if hk_codes:
-        results.update(get_quotes_tencent_batch(hk_codes))
-
-    # 美股：先检测交易时段（Yahoo），常规时段用腾讯批量
-    if us_codes:
-        # 腾讯批量获取（一次请求，快）
-        tencent_us = get_quotes_tencent_batch(us_codes)
-        # Yahoo 并发获取（检测交易时段 + 盘前盘后数据）
-        yahoo_us = {}
-        from concurrent.futures import ThreadPoolExecutor
-        def _fetch_yahoo(code):
-            try:
-                return code, get_quote_yahoo(code)
-            except Exception:
-                return code, None
-        with ThreadPoolExecutor(max_workers=min(8, len(us_codes))) as ex:
-            for code, q in ex.map(_fetch_yahoo, us_codes):
-                if q is not None:
-                    yahoo_us[code] = q
-        # 合并：Yahoo 优先（有交易时段信息），腾讯补充
-        for code in us_codes:
-            yq = yahoo_us.get(code)
-            tq = tencent_us.get(code)
-            if yq:
-                session = yq.get('session_raw', '')
-                if session in ('pre', 'post'):
-                    # 盘前盘后用 Yahoo 数据
-                    results[code] = yq
-                else:
-                    # 常规：用腾讯（更快），补充 Yahoo 的交易时段
-                    if tq and tq.get('price') is not None:
-                        tq['session'] = yq.get('session', '')
-                        tq['session_raw'] = yq.get('session_raw', '')
-                        tq['currency'] = yq.get('currency', 'USD')
-                        results[code] = tq
-                    else:
-                        results[code] = yq
-            elif tq and tq.get('price') is not None:
-                results[code] = tq
-
-    # 韩股/其他：Yahoo 并发
-    if kr_codes:
-        from concurrent.futures import ThreadPoolExecutor
-        def _fetch_yahoo_kr(code):
-            try:
-                return code, get_quote_yahoo(code)
-            except Exception:
-                return code, None
-        with ThreadPoolExecutor(max_workers=min(8, len(kr_codes))) as ex:
-            for code, q in ex.map(_fetch_yahoo_kr, kr_codes):
-                if q is not None:
-                    results[code] = q
-
-    # 其他：腾讯批量
-    if other_codes:
-        results.update(get_quotes_tencent_batch(other_codes))
-
     return results
 
 
 def get_kline(code, period='1min', count=60):
-    """获取K线数据（多周期）
+    """获取 A 股 K 线数据（多周期，带备用源）
+
     period: '1min' | 'daily' | 'weekly'
-    A股: 东方财富 (klt=1/101/102)
-    美股/韩股/港股: Yahoo (interval=1m/1d/1wk)
-    返回: [{'time': str, 'open': float, 'high': float, 'low': float, 'close': float, 'volume': float}, ...]
+    数据源：东方财富 (klt=1/101/102) 优先，失败回退腾讯
+    返回: [{'time','open','high','low','close','volume'}, ...]
     """
-    market = detect_market(code)
-    if market == 'a_share':
-        return _get_kline_eastmoney(code, count, period)
-    elif market in ('us', 'kr', 'yahoo', 'hk'):
-        return _get_kline_yahoo(code, count, period)
-    return []
-
-
+    if detect_market(code) != 'a_share':
+        return []
+    try:
+        klines = _get_kline_eastmoney(code, count, period)
+    except Exception as e:
+        print(f'[KLine] eastmoney error: {e}')
+        klines = []
+    if not klines:
+        # 东财是单点，它不可用时用腾讯兜底，避免 K 线悬浮图整体消失
+        klines = _get_kline_tencent(code, count, period)
+    return klines
 def get_kline_1min(code, count=60):
     """获取1分钟K线数据（兼容旧接口）"""
     return get_kline(code, '1min', count)
+
+
+def _get_kline_tencent(code, count=60, period='1min'):
+    """腾讯 K 线（东方财富不可用时的备用源）
+
+    为什么要有它：此前 K 线只有东方财富一条路，它一挂 K 线悬浮图就整体消失。
+    接口返回字段顺序是「时间, 开, 收, 高, 低, 量」——注意是开收高低，
+    不是常见的开高低收，映射时别搞错。
+    """
+    import json as _json
+    import urllib.request
+
+    kind = {'1min': 'm1', 'daily': 'day', 'weekly': 'week'}.get(period, 'm1')
+    path = 'mkline' if kind == 'm1' else 'kline'
+    param = f'{code},{kind},,{count}' if kind == 'm1' else f'{code},{kind},,,{count}'
+    url = f'https://ifzq.gtimg.cn/appstock/app/kline/{path}?param={param}'
+
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = _json.loads(resp.read().decode('utf-8'))
+        rows = (payload.get('data', {}).get(code, {}) or {}).get(kind) or []
+    except Exception as e:
+        print(f'[KLine Tencent] failed: {e}')
+        return []
+
+    out = []
+    skipped = 0
+    for r in rows:
+        try:
+            ts = str(r[0])
+            # 分钟线时间形如 202609221104，日/周线形如 2026-09-22；
+            # 认不出的格式直接跳过 —— 宁可少一根蜡烛，也不要塞脏数据进图
+            if len(ts) >= 12 and ts.isdigit():
+                t = f'{ts[8:10]}:{ts[10:12]}'
+            elif len(ts) == 10 and ts[4] == '-':
+                t = ts
+            else:
+                skipped += 1
+                continue
+            out.append({
+                'time': t,
+                'open': float(r[1]),
+                'close': float(r[2]),
+                'high': float(r[3]),
+                'low': float(r[4]),
+                'volume': float(r[5]) if r[5] else 0.0,
+            })
+        except (ValueError, IndexError):
+            skipped += 1
+            continue
+    if skipped:
+        print(f'[KLine Tencent] 跳过 {skipped} 条格式异常记录')
+    return out
 
 
 def _get_kline_eastmoney(code, count=60, period='1min'):
@@ -1224,71 +930,6 @@ def _get_kline_eastmoney(code, count=60, period='1min'):
             })
         except (ValueError, IndexError):
             continue
-    return result
-
-
-def _get_kline_yahoo(code, count=60, period='1min'):
-    """Yahoo Finance K线 (美股/韩股/港股)
-    period: '1min'(interval=1m&range=1h) | 'daily'(interval=1d&range=1y) | 'weekly'(interval=1wk&range=2y)
-    """
-    import urllib.request
-    import json as _json
-    import time as _time
-
-    range_map = {'1min': '1h', 'daily': '1y', 'weekly': '2y'}
-    interval_map = {'1min': '1m', 'daily': '1d', 'weekly': '1wk'}
-    interval = interval_map.get(period, '1m')
-    range_val = range_map.get(period, '1h')
-
-    symbol = code
-    if code.lower().startswith('kr'):
-        num = code[2:]
-        symbol = f'{num}.KS' if num.startswith('0') and len(num) == 6 else f'{num}.KQ'
-
-    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval}&range={range_val}'
-    req = urllib.request.Request(url, headers={
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = _json.loads(resp.read().decode('utf-8'))
-    except Exception as e:
-        print(f'[KLine Yahoo] failed: {e}')
-        return []
-
-    result_obj = data.get('chart', {}).get('result')
-    if not result_obj:
-        return []
-
-    timestamps = result_obj[0].get('timestamp', [])
-    indicators = result_obj[0].get('indicators', {})
-    quotes = indicators.get('quote', [{}])[0]
-
-    opens = quotes.get('open', [])
-    highs = quotes.get('high', [])
-    lows = quotes.get('low', [])
-    closes = quotes.get('close', [])
-    volumes = quotes.get('volume', [])
-
-    result = []
-    for i in range(min(len(timestamps), count)):
-        o = opens[i] if i < len(opens) else None
-        h = highs[i] if i < len(highs) else None
-        l = lows[i] if i < len(lows) else None
-        c = closes[i] if i < len(closes) else None
-        v = volumes[i] if i < len(volumes) else 0
-        if o is None or c is None or h is None or l is None:
-            continue
-        if period == '1min':
-            time_str = _time.strftime('%H:%M', _time.localtime(timestamps[i]))
-        else:
-            # 日K/周K: 显示 月-日
-            time_str = _time.strftime('%m-%d', _time.localtime(timestamps[i]))
-        result.append({
-            'time': time_str,
-            'open': o, 'high': h, 'low': l, 'close': c,
-            'volume': v or 0,
-        })
     return result
 
 

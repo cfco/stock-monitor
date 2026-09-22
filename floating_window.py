@@ -2,7 +2,7 @@
 """
 floating_window.py — Stock Monitor 桌面悬浮窗 v5.0
 PySide6 原生 Win11 风格悬浮窗：无边框、置顶、半透明、可拖拽
-复用 price_alert.py 的数据获取逻辑（支持 A股/港股/美股/韩股）
+复用 price_alert.py 的数据获取逻辑（纯 A 股）
 紧凑版：1/3 宽度，支持目标价 + 单日涨跌% 双预警
 """
 
@@ -13,8 +13,26 @@ import time
 import datetime
 import threading
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'scripts'))
-from price_alert import get_quote, detect_market, close_tdx_client, get_quotes_batch, get_kline_1min
+def _resource_dir():
+    """只读资源目录：源码运行时是项目根，打包成 exe 后是 PyInstaller 解包目录。"""
+    if getattr(sys, 'frozen', False):
+        return getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _data_dir():
+    """可写数据目录：必须是用户看得见、重启不丢的位置。
+
+    打包后不能再用 __file__ 定位配置文件 —— 那指向 PyInstaller 的临时解包目录，
+    程序一退出就被清理，用户改好的自选股会莫名丢失。
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+sys.path.insert(0, os.path.join(_resource_dir(), 'scripts'))
+from price_alert import close_tdx_client, get_quotes_batch, get_kline_1min
 
 from PySide6.QtCore import Qt, QThread, Signal, QPoint, QRect, QTimer, QSize
 from PySide6.QtGui import (
@@ -34,8 +52,14 @@ from PySide6.QtWidgets import (
 # ============================================================
 # 配置
 # ============================================================
-VERSION = "5.0"
-CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'scripts', 'watchlist_config.json')
+VERSION = "5.2"
+# 源码运行：项目内 scripts/watchlist_config.json
+# 打包 exe：exe 同级的 watchlist_config.json（用户可直接编辑，重启不丢）
+CONFIG_FILE = (
+    os.path.join(_data_dir(), 'watchlist_config.json')
+    if getattr(sys, 'frozen', False)
+    else os.path.join(_data_dir(), 'scripts', 'watchlist_config.json')
+)
 
 # 颜色 - 涨跌色（两套主题共用）
 COLOR_UP = '#e74c3c'
@@ -108,10 +132,51 @@ PCT_DIR_LABELS = {'below': '跌', 'above': '涨', 'both': '双向'}
 PCT_DIR_VALUES = {'跌': 'below', '涨': 'above', '双向': 'both'}
 
 
+def check_pct_alert(change_pct, target_pct, pct_dir):
+    """单日涨跌幅预警的唯一判定入口（QuoteWorker 与 QuoteCard 共用）。
+
+    口径约定：用户填正数 3 表示「3%」，方向由 pct_dir 决定 ——
+      below = 跌幅达到、above = 涨幅达到、both = 涨跌任一达到。
+
+    返回 (是否触发, 方向中文)。
+
+    为什么要有这个函数：原先判定逻辑在 _check_pct_alert 与 QuoteCard.set_data
+    里各写了一遍，且 below 分支写成 `change_pct <= target_pct`（没取负），
+    用户填 3 时 `change_pct <= 3` 连「涨 1%」都会命中 —— 误触发。
+    抽成单一入口后口径只有一处，不会再分叉。
+    """
+    if change_pct is None or target_pct is None:
+        return False, ''
+    abs_target = abs(target_pct)
+    if pct_dir == 'below':
+        if change_pct <= -abs_target:          # 跌幅达到阈值（填正数 3 表示跌 3%）
+            return True, '跌'
+    elif pct_dir == 'above':
+        if change_pct >= abs_target:           # 涨幅达到阈值
+            return True, '涨'
+    elif abs(change_pct) >= abs_target:        # both/未知：涨跌任一达到
+        return True, '涨' if change_pct >= 0 else '跌'
+    return False, ''
+
+
 # ============================================================
 # 配置读写
 # ============================================================
 def load_config():
+    # 打包后首次运行：exe 同级还没有配置文件，先把随包资源释放一份出来，
+    # 否则用户打开就是空列表，还得自己一个个加
+    if not os.path.exists(CONFIG_FILE):
+        bundled = os.path.join(_resource_dir(), 'scripts', 'watchlist_config.json')
+        if os.path.exists(bundled):
+            try:
+                with open(bundled, 'r', encoding='utf-8-sig') as src:
+                    data = json.load(src)
+                with open(CONFIG_FILE, 'w', encoding='utf-8-sig') as dst:
+                    json.dump(data, dst, ensure_ascii=False, indent=2)
+                print(f'[Config] 已释放默认配置到 {CONFIG_FILE}')
+            except Exception as e:
+                print(f'[Config] 释放默认配置失败: {e}')
+
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8-sig') as f:
             config = json.load(f)
@@ -201,12 +266,7 @@ class QuoteWorker(QThread):
             valid_codes = [item.get('code', '') for item in alerts if item.get('code')]
 
             # A股交易时间外不刷新行情（首次启动除外，避免空白）
-            # 非A股代码（美股/港股/韩股）不受此限制
-            a_codes_in_list = [c for c in valid_codes if detect_market(c) == 'a_share']
-            non_a_codes = [c for c in valid_codes if detect_market(c) != 'a_share']
-            if non_a_codes:
-                should_fetch = True
-            elif a_codes_in_list:
+            if valid_codes:
                 should_fetch = is_first_loop or is_a_share_trading_time()
             else:
                 should_fetch = False
@@ -239,7 +299,7 @@ class QuoteWorker(QThread):
 
                 loop_success = True
 
-                # Yahoo returns klines in chart data, cache them directly
+                # 部分接口会在行情里附带 K 线，直接预填缓存供悬停即时显示
                 klines = q.get('klines', [])
                 if klines:
                     self.kline_cache[code] = (time.time(), klines)
@@ -247,7 +307,6 @@ class QuoteWorker(QThread):
                 payload = {
                     'name': name,
                     'code': code,
-                    'market': detect_market(code),
                     'price': price,
                     'change_pct': q.get('change_pct'),
                     'yest_close': q.get('yest_close'),
@@ -257,8 +316,6 @@ class QuoteWorker(QThread):
                     'pct_dir': pct_dir,
                     'position': position,
                     'note': note,
-                    'currency': q.get('currency', ''),
-                    'session': q.get('session', ''),
                     'last_update': now_str,
                     'klines': klines,
                 }
@@ -316,8 +373,7 @@ class QuoteWorker(QThread):
             # 非交易时间跳过1分钟K线刷新（首次启动除外，避免空白）
             if not self._kline_fetching and (is_first_loop or is_a_share_trading_time()):
                 self._kline_fetching = True
-                a_codes = [item.get('code', '') for item in alerts
-                           if item.get('code') and detect_market(item['code']) == 'a_share']
+                a_codes = [item.get('code', '') for item in alerts if item.get('code')]
                 codes_to_fetch = []
                 now_ts = time.time()
                 for c in a_codes:
@@ -335,7 +391,7 @@ class QuoteWorker(QThread):
             if not self._kline_period_fetching and (is_first_loop or is_a_share_trading_time()):
                 period_pairs = []
                 now_ts = time.time()
-                # 所有市场都支持日K/周K（A股走东方财富，美股/韩股/港股走Yahoo）
+                # 日K/周K 统一走东方财富
                 all_codes = [item.get('code', '') for item in alerts if item.get('code')]
                 for c in all_codes:
                     for period in ('daily', 'weekly'):
@@ -402,22 +458,14 @@ class QuoteWorker(QThread):
         return False, ''
 
     def _check_pct_alert(self, name, code, change_pct, target_pct, pct_dir):
-        """涨跌幅预警：默认用绝对值比较（写3则涨跌3%都触发）
-        pct_dir: below=仅跌, above=仅涨, both=绝对值(默认)
+        """涨跌幅预警：判定统一走模块级 check_pct_alert
+
+        写 3 表示 3%，方向由 pct_dir 决定（below=仅跌, above=仅涨, both=涨跌任一）
         """
-        abs_change = abs(change_pct)
-        abs_target = abs(target_pct)
-        if pct_dir == 'below':
-            if change_pct <= target_pct:
-                return True, f'{name} 跌幅达 {change_pct:.2f}% ≤ {target_pct}%'
-        elif pct_dir == 'above':
-            if change_pct >= target_pct:
-                return True, f'{name} 涨幅达 {change_pct:.2f}% ≥ {target_pct}%'
-        else:  # both: 绝对值，涨跌都触发
-            if abs_change >= abs_target:
-                direction = '跌' if change_pct < 0 else '涨'
-                return True, f'{name} {direction}幅达 {change_pct:+.2f}% 超过 {abs_target}%'
-        return False, ''
+        hit, direction = check_pct_alert(change_pct, target_pct, pct_dir)
+        if not hit:
+            return False, ''
+        return True, f'{name} {direction}幅 {abs(change_pct):.2f}% 达到 {abs(target_pct)}%'
 
 
 
@@ -847,10 +895,7 @@ class QuoteCard(QFrame):
         pct_dir = data.get('pct_dir', 'below')
         position = data.get('position', '')
         note = data.get('note', '')
-        market = data.get('market', '')
-        currency = data.get('currency', '')
         last_update = data.get('last_update', '')
-        session = data.get('session', '')
         name = data.get('name', self.name)
 
         # 更新名称（如有变化）
@@ -858,16 +903,8 @@ class QuoteCard(QFrame):
             self.name = name
             self._update_name_elided()
 
-        # 货币符号
-        currency_symbol = ''
-        if currency == 'USD':
-            currency_symbol = '$'
-        elif currency == 'KRW':
-            currency_symbol = '₩'
-        elif currency == 'HKD':
-            currency_symbol = 'HK$'
-        elif market == 'a_share':
-            currency_symbol = '¥'
+        # 货币符号：项目已收敛为纯 A 股，固定人民币
+        currency_symbol = '¥'
 
         if price is not None:
             # ETF（510开头）和部分基金需要3位小数，其他股票2位
@@ -904,19 +941,13 @@ class QuoteCard(QFrame):
                 trigger_reason = f'{DIR_LABELS.get(direction, direction)}{target}'
 
         if not triggered and target_pct is not None and change_pct is not None:
-            pct_dir = data.get('pct_dir', 'both')
-            abs_change = abs(change_pct)
-            abs_target = abs(target_pct)
-            if pct_dir == 'below' and change_pct <= target_pct:
+            # 判定口径与 QuoteWorker 共用同一函数，避免两处逻辑再次分叉
+            pct_hit, direction_cn = check_pct_alert(
+                change_pct, target_pct, data.get('pct_dir', 'both')
+            )
+            if pct_hit:
                 triggered = True
-                trigger_reason = f'跌≤{target_pct}%'
-            elif pct_dir == 'above' and change_pct >= target_pct:
-                triggered = True
-                trigger_reason = f'涨≥{target_pct}%'
-            elif abs_change >= abs_target:  # both: 绝对值
-                triggered = True
-                direction_cn = '跌' if change_pct < 0 else '涨'
-                trigger_reason = f'{direction_cn}≥{abs_target}%'
+                trigger_reason = f'{direction_cn}≥{abs(target_pct)}%'
 
         # 状态显示：不显示预警文字，仅通过绿色底色表示触发
         self.status_label.setText('')
@@ -927,26 +958,12 @@ class QuoteCard(QFrame):
         elif not triggered and self._triggered:
             self._apply_default_style()
 
-        # 市场标签
-        market_text = {
-            'a_share': 'A', 'hk': '港', 'us': '美', 'kr': '韩', 'yahoo': 'Y'
-        }.get(market, '')
-        session_colors = {
-            '盘前': '#f39c12', '盘后': '#9b59b6', '已休市': COLOR_FLAT
-        }
-        if session and session != '常规':
-            self.market_label.setText(market_text)
-            color = session_colors.get(session, COLOR_FLAT)
-            self.market_label.setStyleSheet(
-                f'color: {color}; font-size: 9px;'
-                f'border: 1px solid {color}; border-radius: 2px;'
-            )
-        else:
-            self.market_label.setText(market_text)
-            self.market_label.setStyleSheet(
-                f'color: {get_color("text_dim")}; font-size: 9px;'
-                f'border: 1px solid {get_color("border")}; border-radius: 2px;'
-            )
+        # 市场标签：项目只支持 A 股，固定显示「A」
+        self.market_label.setText('A')
+        self.market_label.setStyleSheet(
+            f'color: {get_color("text_dim")}; font-size: 9px;'
+            f'border: 1px solid {get_color("border")}; border-radius: 2px;'
+        )
 
     def _on_theme_changed(self):
         """主题切换时刷新所有标签颜色"""
@@ -1020,19 +1037,6 @@ class _StockResolveThread(QThread):
                 if not candidates:
                     candidates = [('sh' + text, '')]
 
-            # 纯字母：美股
-            elif text.isalpha():
-                full_code = 'us' + text.upper()
-                try:
-                    q = get_quote_tencent(full_code)
-                    name = q.get('name', '')
-                    price = q.get('price')
-                    if name and name != full_code and price and price > 0:
-                        candidates = [(full_code, name)]
-                    else:
-                        candidates = [(full_code, '')]
-                except Exception:
-                    candidates = [(full_code, '')]
         except Exception as e:
             import traceback
             print(f'[StockResolveThread] error: {e}\n{traceback.format_exc()}')
@@ -1112,7 +1116,7 @@ class SettingsDialog(QDialog):
         top_form.addRow('K线图大小:', self.kline_size_combo)
 
         self.source_combo = QComboBox()
-        self.source_combo.addItems(['auto', 'tencent', 'yahoo', 'tdx'])
+        self.source_combo.addItems(['auto', 'tencent', 'tdx'])
         self.source_combo.setCurrentText(self.config.get('source', 'auto'))
         top_form.addRow('数据源:', self.source_combo)
 
@@ -1409,6 +1413,9 @@ class SettingsDialog(QDialog):
         self.config['kline_size'] = self.kline_size_combo.currentText()
         self.config['source'] = self.source_combo.currentText()
         self.config['theme'] = self.theme_combo.currentText()
+        # 必须一并保存：start_monitor() 会读 config['tdx_host'] 覆盖 price_alert 的节点表，
+        # 漏存则界面上填的自定义 TDX 服务器每次重启都丢失（原先就是这个问题）
+        self.config['tdx_host'] = self.tdx_host_edit.text().strip()
         self.config['alerts'] = alerts
 
         if save_config(self.config):
@@ -1452,7 +1459,7 @@ class FloatingWindow(QWidget):
         # auto 模式下每 10 秒检测屏幕颜色
         self._theme_timer = QTimer(self)
         self._theme_timer.timeout.connect(self._check_theme)
-        self._theme_timer.start(3000)
+        self._theme_timer.start(10000)   # 与上方注释一致；原 3 秒过于频繁（每次含截图 + 200 点采样）
 
         QTimer.singleShot(300, self.start_monitor)
 
@@ -1661,7 +1668,6 @@ class FloatingWindow(QWidget):
                 'pct_dir': item.get('pct_dir', 'below'),
                 'position': item.get('position', ''),
                 'note': item.get('note', ''),
-                'market': detect_market(code),
                 'last_update': '--',
             })
             self.list_layout.insertWidget(self.list_layout.count() - 1, card)
