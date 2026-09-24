@@ -159,6 +159,24 @@ def check_pct_alert(change_pct, target_pct, pct_dir):
     return False, ''
 
 
+def check_price_alert(price, target, direction):
+    """目标价预警的唯一判定入口（QuoteWorker 与 QuoteCard 共用）。
+
+    方向约定：below=跌破, above=涨破, both=双向。
+    返回 (是否触发, 方向中文)。
+
+    原先 _check_alert 与 QuoteCard.set_data 里各写一遍 `price <= target` 判定，
+    两处口径可能再次分叉；抽成单一入口后判定逻辑只有一处。
+    """
+    if price is None or target is None:
+        return False, ''
+    if direction in ('below', 'both') and price <= target:
+        return True, DIR_LABELS.get('below', '跌破')
+    if direction in ('above', 'both') and price >= target:
+        return True, DIR_LABELS.get('above', '涨破')
+    return False, ''
+
+
 # ============================================================
 # 配置读写
 # ============================================================
@@ -204,14 +222,14 @@ def save_config(config):
 
 def is_a_share_trading_time(now=None):
     """判断当前是否在A股交易时间段
-    交易时段：09:10-11:30, 13:00-15:00（周末不交易）
+    交易时段：09:25-11:30, 13:00-15:00（周末不交易）
     """
     now = now or datetime.datetime.now()
     if now.weekday() >= 5:  # 周六、周日
         return False
     minutes = now.hour * 60 + now.minute
-    # 9:10=550, 11:30=690, 13:00=780, 15:00=900
-    if 550 <= minutes <= 690:
+    # 9:25=565, 11:30=690, 13:00=780, 15:00=900
+    if 565 <= minutes <= 690:
         return True
     if 780 <= minutes <= 900:
         return True
@@ -234,6 +252,7 @@ class QuoteWorker(QThread):
         self._lock = threading.Lock()
         self.alert_cooldown = {}
         self.kline_cache = {}       # {code: (timestamp, klines)} 1分钟; {code_daily/weekly: ...} 日K/周K
+        self._kline_lock = threading.Lock()  # 保护 kline_cache 跨线程读写
         self._kline_fetching = False
         self._kline_period_fetching = False
         self._first_loop = True     # 首次循环标记（启动时无论是否交易时间都请求一次，避免空白）
@@ -241,6 +260,19 @@ class QuoteWorker(QThread):
     def update_config(self, config):
         with self._lock:
             self.config = config
+
+    def _kline_get(self, key):
+        """线程安全地读 K 线缓存（返回 (timestamp, klines) 或 None）"""
+        with self._kline_lock:
+            return self.kline_cache.get(key)
+
+    def _kline_put(self, key, klines):
+        """线程安全地写 K 线缓存，并做无界增长防护（超过上限淘汰最久未访问）"""
+        with self._kline_lock:
+            self.kline_cache[key] = (time.time(), klines)
+            if len(self.kline_cache) > 600:
+                oldest = min(self.kline_cache, key=lambda k: self.kline_cache[k][0])
+                self.kline_cache.pop(oldest, None)
 
     def stop(self):
         self.running = False
@@ -302,7 +334,7 @@ class QuoteWorker(QThread):
                 # 部分接口会在行情里附带 K 线，直接预填缓存供悬停即时显示
                 klines = q.get('klines', [])
                 if klines:
-                    self.kline_cache[code] = (time.time(), klines)
+                    self._kline_put(code, klines)
 
                 payload = {
                     'name': name,
@@ -377,7 +409,7 @@ class QuoteWorker(QThread):
                 codes_to_fetch = []
                 now_ts = time.time()
                 for c in a_codes:
-                    last_ts = self.kline_cache.get(c, (0, []))[0]
+                    last_ts = (self._kline_get(c) or (0, []))[0]
                     if now_ts - last_ts > 30:
                         codes_to_fetch.append(c)
                 if codes_to_fetch:
@@ -386,18 +418,18 @@ class QuoteWorker(QThread):
                 else:
                     self._kline_fetching = False
 
-            # 日K/周K 异步预加载（启动时请求一次，之后每小时刷新一次）
-            # 非交易时间跳过刷新（首次启动除外，避免空白）
-            if not self._kline_period_fetching and (is_first_loop or is_a_share_trading_time()):
+            # 日K/周K 异步预加载（启动时全刷；之后距上次预加载 > 60min 即刷新）
+            # 不再以「是否交易时间」为硬性门控：交易时间内按此门控正常刷新，
+            # 非交易时间若距上次预加载已超 60min 也会刷新，避免长期挂机却一直显示旧 K 线
+            if not self._kline_period_fetching:
                 period_pairs = []
                 now_ts = time.time()
-                # 日K/周K 统一走东方财富
                 all_codes = [item.get('code', '') for item in alerts if item.get('code')]
                 for c in all_codes:
                     for period in ('daily', 'weekly'):
                         cache_key = f'{c}_{period}'
-                        last_ts = self.kline_cache.get(cache_key, (0, []))[0]
-                        if now_ts - last_ts > 3600:  # 1小时
+                        last_ts = (self._kline_get(cache_key) or (0, []))[0]
+                        if is_first_loop or now_ts - last_ts > 3600:  # 首轮或距上次预加载 > 60min
                             period_pairs.append((c, period))
                 if period_pairs:
                     self._kline_period_fetching = True
@@ -427,7 +459,7 @@ class QuoteWorker(QThread):
                 try:
                     klines = get_kline_1min(code, 60)
                     if klines:
-                        self.kline_cache[code] = (time.time(), klines)
+                        self._kline_put(code, klines)
                 except Exception as e:
                     print(f'[Kline Prefetch] {code} failed: {e}')
         finally:
@@ -444,18 +476,18 @@ class QuoteWorker(QThread):
                     klines = get_kline(code, period, 60)
                     if klines:
                         cache_key = f'{code}_{period}'
-                        self.kline_cache[cache_key] = (time.time(), klines)
+                        self._kline_put(cache_key, klines)
                 except Exception as e:
                     print(f'[Kline {period}] {code} failed: {e}')
         finally:
             self._kline_period_fetching = False
 
     def _check_alert(self, name, code, price, target, direction):
-        if direction in ('below', 'both') and price <= target:
-            return True, f'{name} 跌破 {target} | 当前: {price:.2f}'
-        if direction in ('above', 'both') and price >= target:
-            return True, f'{name} 涨破 {target} | 当前: {price:.2f}'
-        return False, ''
+        # 判定口径与 QuoteCard 共用模块级 check_price_alert，避免两处分叉
+        hit, dir_cn = check_price_alert(price, target, direction)
+        if not hit:
+            return False, ''
+        return True, f'{name} {dir_cn} {target} | 当前: {price:.2f}'
 
     def _check_pct_alert(self, name, code, change_pct, target_pct, pct_dir):
         """涨跌幅预警：判定统一走模块级 check_pct_alert
@@ -748,7 +780,9 @@ class QuoteCard(QFrame):
         self._hover_timer.setSingleShot(True)
         self._hover_timer.timeout.connect(self._request_kline)
         self.setMouseTracking(True)
-        self.setAttribute(Qt.WA_Hover, True)
+        # 不在构造时常驻开启 WA_Hover（持续产生 hover 事件有开销），
+        # 改为进入卡片时开启、离开时关闭（见 enterEvent/leaveEvent）。
+        # 周期按钮自身的 WA_Hover 保留，用于 hover 切换 K 线周期。
 
         # K线周期切换按钮（浮动在卡片右侧内容上方，不占布局空间）
         self._period_buttons = {}
@@ -790,12 +824,16 @@ class QuoteCard(QFrame):
 
     def enterEvent(self, event):
         """鼠标进入卡片: 300ms防抖后请求K线，并显示周期按钮"""
+        # 进入时才开启 WA_Hover，减少非悬停态下的 hover 事件处理开销
+        self.setAttribute(Qt.WA_Hover, True)
         self._hover_timer.start(300)
         self._show_period_buttons()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
         """鼠标离开卡片: 取消请求并隐藏K线图和按钮"""
+        # 离开时关闭 WA_Hover，hover 开销只在悬停期间承担
+        self.setAttribute(Qt.WA_Hover, False)
         self._hover_timer.stop()
         for btn in self._period_buttons.values():
             btn.setVisible(False)
@@ -857,12 +895,11 @@ class QuoteCard(QFrame):
 
     def _apply_triggered_style(self):
         self._triggered = True
+        # 触发态背景/边框统一由 paintEvent 绘制，这里不再设置背景色与边框，
+        # 避免「样式表背景」与「paintEvent 重绘」双重绘制导致覆盖/闪烁。
+        # 仅保留标签文字色（黑）的样式。
         self.setStyleSheet(
-            f'#quoteCard {{'
-            f'  background: {COLOR_TRIGGERED};'
-            f'  border: 2px solid #ffffff;'
-            f'  border-radius: 6px;'
-            f'}}'
+            f'#quoteCard {{ border: none; }}'
             f'QLabel {{ background: transparent; color: #000000; }}'
         )
         self.update()
@@ -933,12 +970,13 @@ class QuoteCard(QFrame):
         trigger_reason = ''
 
         if target is not None and price is not None:
-            if direction in ('below', 'both') and price <= target:
+            # 判定口径与 QuoteWorker 共用模块级 check_price_alert，避免两处分叉
+            hit, dir_cn = check_price_alert(price, target, direction)
+            if hit:
                 triggered = True
-                trigger_reason = f'{DIR_LABELS.get(direction, direction)}{target}'
-            if direction in ('above', 'both') and price >= target:
-                triggered = True
-                trigger_reason = f'{DIR_LABELS.get(direction, direction)}{target}'
+                # both 方向不展示具体破位方向，沿用原口径「双向」
+                label = '双向' if direction == 'both' else dir_cn
+                trigger_reason = f'{label}{target}'
 
         if not triggered and target_pct is not None and change_pct is not None:
             # 判定口径与 QuoteWorker 共用同一函数，避免两处逻辑再次分叉
@@ -1316,6 +1354,11 @@ class SettingsDialog(QDialog):
 
         # 如果上一个线程还在跑，等它结束
         if self._resolve_thread and self._resolve_thread.isRunning():
+            # 断开旧线程信号，避免其慢回调在换新线程后写错行
+            try:
+                self._resolve_thread.finished_resolve.disconnect(self._on_resolve_done)
+            except (TypeError, RuntimeError):
+                pass
             self._resolve_thread.quit()
             self._resolve_thread.wait(2000)
 
@@ -1373,6 +1416,15 @@ class SettingsDialog(QDialog):
 
             code = code_item.text().strip() if code_item else ''
             if not code:
+                continue
+            # 保存时校验 A 股格式，避免脏代码入库（取数时会被静默忽略，
+            # 且与 README「非 A 股代码会被拒绝」口径一致）
+            c_low = code.lower()
+            if not (c_low[:2] in ('sh', 'sz', 'bj') and c_low[2:].isdigit() and len(c_low) == 8):
+                QMessageBox.warning(
+                    self, '代码格式错误',
+                    f'「{code}」不是合法的 A 股代码（应为 sh/sz/bj + 6 位数字），已跳过',
+                )
                 continue
 
             name = name_item.text().strip() if name_item else code
@@ -1456,10 +1508,10 @@ class FloatingWindow(QWidget):
         self._init_ui()
         self._move_to_bottom_right()
 
-        # auto 模式下每 10 秒检测屏幕颜色
+        # auto 模式下每 30 秒检测屏幕颜色（截图 + 200 点采样开销不小，10s 仍偏频繁）
         self._theme_timer = QTimer(self)
         self._theme_timer.timeout.connect(self._check_theme)
-        self._theme_timer.start(10000)   # 与上方注释一致；原 3 秒过于频繁（每次含截图 + 200 点采样）
+        self._theme_timer.start(30000)   # 10s→30s：降低截图与像素采样频率
 
         QTimer.singleShot(300, self.start_monitor)
 
@@ -1592,7 +1644,7 @@ class FloatingWindow(QWidget):
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         """双击任意位置关闭程序"""
         if event.button() == Qt.LeftButton:
-            QApplication.quit()
+            self.close()
 
     def _build_tray_icon(self):
         """创建系统托盘图标"""
@@ -1605,7 +1657,7 @@ class FloatingWindow(QWidget):
         show_action = QAction('显示悬浮窗', menu)
         show_action.triggered.connect(self.show)
         quit_action = QAction('退出', menu)
-        quit_action.triggered.connect(QApplication.quit)
+        quit_action.triggered.connect(self.close)
         menu.addAction(show_action)
         menu.addSeparator()
         menu.addAction(quit_action)
@@ -1807,8 +1859,8 @@ class FloatingWindow(QWidget):
         """
         cache_key = code if period == '1min' else f'{code}_{period}'
         klines = []
-        if self.worker and hasattr(self.worker, 'kline_cache'):
-            cached = self.worker.kline_cache.get(cache_key)
+        if self.worker and hasattr(self.worker, '_kline_get'):
+            cached = self.worker._kline_get(cache_key)
             if cached:
                 klines = cached[1]
         # 有缓存则显示；无缓存（日K/周K尚未加载）也显示空态，保持位置稳定
@@ -1875,9 +1927,11 @@ class FloatingWindow(QWidget):
                 QSystemTrayIcon.Warning,
                 5000,
             )
-        self.show()
-        self.raise_()
-        self.activateWindow()
+        # 仅在窗口不可见时才唤起，避免每次预警都强抢焦点打断用户操作
+        if not self.isVisible():
+            self.show()
+            self.raise_()
+            self.activateWindow()
 
     def on_status(self, status):
         if status == 'running':
@@ -1911,6 +1965,9 @@ class FloatingWindow(QWidget):
         except Exception:
             pass
         event.accept()
+        # 清理完毕后真正退出进程：app 设了 setQuitOnLastWindowClosed(False)，
+        # 仅 accept 不会终止进程；双击/托盘「退出」都走这里，需显式 quit
+        QApplication.quit()
 
 
 
