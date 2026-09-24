@@ -1,0 +1,88 @@
+
+
+############## CHUNK 1/7: 1-source-tracker+TDX (lines 39-306) ##############
+----- node-b:kilo-auto/free [ok] 143304ms -----
+[中] get_quote_tdx:286 —— last_price 未做空值/类型校验即参与减法运算，若为 None 或非数值将抛 TypeError 导致取数线程崩溃 | `last_price = q.last_price` → `change_pct = ((last_price - pre_close) / pre_close) * 100`（第283、286行）；而前一行 pre_close 有 `if pre_close and pre_close > 0` 防护，二者不对称 | 增加 `if last_price is not None and isinstance(last_price, (int, float))` 前置校验，否则 change_pct 置 None 并跳过计算
+
+[中] _source_mark_fail:96-109 —— 并发竞态（TOCTOU）：计数读取与屏蔽判定分两段加锁，锁间时间窗内若 `_source_mark_success` 被调用将计数清零，本线程仍基于已捕获的局部变量 cnt 触发屏蔽，导致刚返回有效数据的源被错误屏蔽 | 第100行 `cnt = SOURCE_FAIL_COUNTS[name]`（锁内）→ 锁释放 → 第102行 `if cnt >= MAX_CONSECUTIVE_FAILS`（锁外）→ 第103行重新加锁执行 `SOURCE_DISABLED.add(name)` | 将第98-109行合并为单一 `with _SOURCE_LOCK` 临界区，计数读取、判定、屏蔽操作在同一次持锁内完成
+
+[中] get_available_nodes:234 —— `_failed_nodes` 集合无锁遍历，与 `get_tdx_client` 中的并发修改（add/discard/clear）可能触发 `RuntimeError: Set changed size during iteration` 导致调用方崩溃 | `return [n for n in TDX_NODES if n['host'] not in _failed_nodes]`（第234行）；`_failed_nodes` 在第198、203、206行被修改时仅在 `get_tdx_client` 内部间接依赖 `_tdx_lock`，而 `get_available_nodes` 未加该锁 | 加 `_tdx_lock` 后再遍历，或返回快照 `list(n for n in TDX_NODES if n['host'] not in _failed_nodes)`
+----- node-b:stepfun/step-3.7-flash:free [ok] 47831ms -----
+[中] _source_mark_fail:98 —— 并发竞态：释放锁后基于局部变量cnt判断屏蔽，期间其他线程可能已清零计数，导致已恢复源被错误屏蔽 | 证据代码：`with _SOURCE_LOCK: ... cnt = SOURCE_FAIL_COUNTS[name]` 后释放锁，再执行 `if cnt >= MAX_CONSECUTIVE_FAILS:` | 修复建议：将计数读取与屏蔽判断逻辑置于同一锁保护范围内，或重新读取当前计数值进行判断
+
+[中] get_tdx_client:192 —— KeyError风险：sorted的key函数直接访问n['host']，若TDX_NODES配置项缺少host字段将崩溃 | 证据代码：`key=lambda n: (n['host'] in _failed_nodes, n.get('priority', 99))` | 修复建议：将n['host']改为n.get('host')，或前置校验节点字典结构完整性
+
+[中] get_tdx_client:175 —— 并发竞态：检查_tdx_client非空后返回，但无锁保护，多线程下可能返回已被close_tdx_client置为None的无效客户端 | 证据代码：`if _tdx_client is not None: return _tdx_client`（无锁保护） | 修复建议：在get_tdx_client入口使用_tdx_lock保护对全局客户端实例的检查与返回
+----- node-b:qwen/qwen3.8-27b:free [timeout] Nonems -----
+<timeout>
+
+
+############## CHUNK 2/7: 2-parse+single-quote (lines 307-419) ##############
+----- node-b:kilo-auto/free [ok] 58800ms -----
+无
+----- node-b:stepfun/step-3.7-flash:free [ok] 18861ms -----
+无
+----- node-b:qwen/qwen3.8-27b:free [ok] 45363ms -----
+[中] get_quote_tencent:357 —— HTTP 连接资源泄漏 | `urllib.request.urlopen`/`_HTTP_OPENER.open` 未被 `with` 正确管理，`content = resp.read().decode('gbk')` 在 `resp` 关闭前可能抛出异常（如 GBK 解码错误 `UnicodeDecodeError`），导致 `resp` 未被关闭 | 使用 `try/finally` 确保 `resp.close()` 被调用，或将 `resp.read()` 与 `decode` 分离并捕获 `UnicodeDecodeError`
+
+[中] get_quote_tencent:358 —— 字符集解码异常未捕获 | `resp.read().decode('gbk')` 可能抛出 `UnicodeDecodeError`（非法 GBK 字节），该异常未被捕获，向上层透传 | 捕获 `UnicodeDecodeError` 并抛出更清晰的 `ValueError`，或使用 `errors='replace'`/`errors='ignore'`
+
+[中] get_quote:406 —— 过于宽泛的异常捕获掩盖错误 | `except Exception:` 捕获所有异常（包括 `KeyboardInterrupt` 子类意外、编程错误如 `AttributeError`），可能隐藏 `get_quote_tdx` 的真实缺陷，回退到腾讯可能掩盖系统性问题 | 仅捕获已知可恢复的异常（如网络超时 `socket.timeout`、`ConnectionError`），重新抛出其他异常
+
+[高] get_quote_tencent:365 —— 解析失败返回 None 后未校验 change_pct 等关键字段 | `_parse_tencent_response` 可能返回 `quote` 包含 `price=None`（已处理），但 `change_pct`、`high`、`low` 等字段为 `None` 时，上层涨跌逻辑可能因 `None` 参与运算（如除零或比较）崩溃 | 在 `get_quote_tencent` 中对 `change_pct` 等关键字段也进行非空校验，或在上层调用前统一校验
+
+[中] _parse_tencent_response:333 —— price 字段为空字符串时设为 None，但未校验数值范围 | `float(f[_TENCENT_F_PRICE])` 可能解析出非法值（如负数、极大值），腾讯接口返回异常数据时可能导致上层逻辑错误 | 增加数值范围校验（如 `0 < price < 10000`），非法值返回 `None`
+
+
+############## CHUNK 3/7: 3-tencent+sina-batch (lines 420-566) ##############
+----- node-b:kilo-auto/free [ok] 101819ms -----
+[高] get_quotes_tencent_batch:471-475 —— 回退匹配伪逻辑：注释写"用 ret_code 反查"，实际却忽略 ret_code，将行情硬塞给 codes 中第一个未被占用的代码，导致行情张冠李戴 | `for orig_code in codes: if orig_code not in results: results[orig_code] = quote; break` | 回退分支应以 ret_code 精确匹配 norm_code/orig_code，无匹配则 `continue` 跳过该条行情
+
+[高] get_quotes_tencent_batch:465 —— `endswith` 后缀匹配过松，不同股票代码可能误判为同一代码（如 sh601398 与 601398/61398），行情错配到错误代码 | `norm_code.upper().endswith(ret_code.upper())` | 改为 `norm_code == ret_code` 精确比较；如需容忍前缀差异，应统一规范化后再比较并加长度/边界校验
+
+[中] get_quotes_tencent_batch:456 —— `_parse_tencent_response(match_str)` 位于 for 循环体内且无 try/except，外层 try（第435行）仅覆盖 HTTP 请求；单条解析异常会直接抛出、导致整个批量接口崩溃 | `quote = _parse_tencent_response(match_str)` | 用 `try/except` 包裹解析调用，单条失败则 `continue`，保证其余代码仍能返回
+
+[中] get_quotes_tencent_batch:450-451 —— 输入 `codes` 含重复代码时 `code_map[code] = normalized[i]` 字典去重折叠，后续匹配只能命中其中一条，部分代码永久丢失行情 | `code_map[code] = normalized[i]` | 改用 `list(zip(codes, normalized))` 保留重复映射，或在上游对 codes 去重
+
+[中] get_quotes_tencent_batch:455+465 —— `ret_code` 解析失败为空字符串时，`norm_code.upper().endswith('')` 恒为 `True`，第一条 code 快照会被错误匹配并写入结果 | `ret_code = f[2] if len(f) > 2 else ''` 配合 `norm_code.upper().endswith(ret_code.upper())` | `ret_code` 为空时直接 `continue` 跳过该条 match_str，不进入匹配流程
+----- node-b:stepfun/step-3.7-flash:free [ok] 73402ms -----
+[中] get_quotes_tencent_batch:465 —— ret_code为空字符串时endswith('')恒为True导致错误匹配 | 第455行ret_code可为空，第465行`norm_code.upper().endswith(ret_code.upper())`在ret_code为空时恒成立，若quote含price会错误赋值给首个orig_code | 在第455行后增加`if not ret_code: continue`，或修改465行条件为`if ret_code and (norm_code == ret_code or norm_code.upper().endswith(ret_code.upper()))`
+[中] get_quotes_tencent_batch:471 —— 反查逻辑无条件匹配导致错误映射 | 第471-475行当ret_code未匹配时，遍历codes将quote无条件分配给首个未匹配orig_code，可能将其他代码行情错误归属 | 建立ret_code到orig_code的反向映射，仅当ret_code存在于反向映射中时才赋值
+----- node-b:qwen/qwen3.8-27b:free [ok] 64594ms -----
+[高] get_quotes_tencent_batch:465 —— 条件错误导致涨跌/匹配逻辑错乱 | `norm_code.upper().endswith(ret_code.upper())` | 应使用 `ret_code.upper() in norm_code.upper()` 或严格相等，`endswith` 会把 `sh601398` 错误匹配到 `sh000001` 等后缀相同的代码 |
+
+[中] get_quotes_tencent_batch:474 —— 错误回填把无效 quote 写入结果 | `results[orig_code] = quote`（兜底分支未校验 `quote.get('price') is not None`）| 应在赋值前加 `if quote.get('price') is not None:` |
+
+[中] get_quotes_sina_batch:533 —— 非涨停股票 price 被错误覆盖 | `if price is None or price <= 0:`（对正常 0.01 元等低价股也触发兜底）| 应仅对 `price is None` 时兜底，或判断 `price == 0` |
+
+[中] get_quotes_sina_batch:529 —— 解析逻辑错位风险 | `open_price = float(fields[1])`（未校验 `len(fields) > 1`）| 虽然已有 `len(fields) < 6` 检查，但 `fields[6]/[7]` 访问仍依赖 `len(fields)`，建议统一用 `len(fields) > N` 守卫 |
+
+[高] get_quotes_tencent_batch:454 —— 解析易崩溃风险 | `f = match_str.split('~')` 后直接 `f[2]`（未校验 `len(f) > 2`）| 虽有 `if len(f) > 2 else ''`，但 `_parse_tencent_response` 内部可能仍有越界访问，建议在 `_parse_tencent_response` 中加 `len(f)` 校验 |
+
+
+############## CHUNK 4/7: 4-sqt+eastmoney-his (lines 567-694) ##############
+----- node-b:kilo-auto/free [ok] 132202ms -----
+[中] get_quotes_tencent_sqt_batch:606 —— ret_code 为空字符串时 `endswith('')` 恒为 True，脏/异常行情会被误匹配到首个未命中代码，造成数据错配 | `norm_code.upper().endswith(ret_code.upper())`（ret_code 由 `f[2] if len(f) > 2 else ''` 可能得到 ''） | 匹配前加 `if not ret_code: continue`，或改为 `ret_code and (norm_code == ret_code or norm_code.upper().endswith(ret_code.upper()))`
+
+[中] get_quotes_tencent_sqt_batch:611-615 —— 未命中兜底时无条件把当前 quote 赋给 codes 中第一个未命中的代码，与 ret_code 无关时张冠李戴 | `if not matched and ret_code: for orig_code in codes: if orig_code not in results: results[orig_code] = quote; break` | 删除无条件兜底；若保留，必须先校验 ret_code 与目标代码的后缀/包含关系，且只匹配唯一候选
+
+[中] get_quotes_tencent_sqt_batch:606 —— `endswith` 模糊匹配在两个请求代码互为后缀时（如 '600001' 与 '000001'）按字典序错误配对 | `norm_code.upper().endswith(ret_code.upper())` | 优先精确匹配 `norm_code == ret_code`；使用 endswith 时要求该后缀在候选集中唯一，否则跳过
+
+[中] get_quotes_eastmoney_his_batch:630-637 —— 输入代码缺 sh/sz 前缀时被静默丢弃（不进 secid_map），最终 results 缺项且无日志/异常 | `if c.startswith('sh')...elif c.startswith('sz')...` 与 `if not secid_map: return {}` | 对无前缀代码按六位数字推断市场构造 secid，或 raise ValueError 并打印 `[Eastmoney HIS] skip unprefixed code: {code}`
+----- node-b:stepfun/step-3.7-flash:free [ok] 53897ms -----
+[中] get_quotes_tencent_sqt_batch:606 —— 空ret_code导致错误匹配 | `norm_code.upper().endswith(ret_code.upper())` 当ret_code为空字符串时恒为True | 当接口返回数据解析失败时，错误地将行情分配给首个请求code，造成数据污染；应增加ret_code非空检查
+[中] get_quotes_tencent_sqt_batch:611 —— 兜底逻辑导致数据错位 | `if not matched and ret_code: results[orig_code] = quote` | 当接口返回未请求code的行情时，错误分配给首个未匹配code导致数据错位；应直接丢弃未匹配行情
+----- node-b:qwen/qwen3.8-27b:free [timeout] Nonems -----
+<timeout>
+
+
+############## CHUNK 5/7: 5-eastmoney+get_quotes_batch (lines 695-847) ##############
+----- node-b:kilo-auto/free [timeout] Nonems -----
+<timeout>
+----- node-b:stepfun/step-3.7-flash:free [ok] 39099ms -----
+[中] get_quotes_eastmoney_batch:731 —— API返回null时_json.loads返回None，调用.get引发AttributeError崩溃 | 证据：`diff = data.get('data', {}).get('diff', [])` | 修复建议：添加`if not isinstance(data, dict): return {}`校验
+[中] get_quotes_eastmoney_batch:747 —— 市场代码f13可能为字符串，与整数1比较失败导致沪市误判为深市 | 证据：`prefix = 'sh' if market == 1 else 'sz'` | 修复建议：使用`str(market) == '1'`或统一转为整数比较
+[中] get_quotes_batch:840 —— 腾讯兜底补充数据时仅校验price非空，未过滤price<=0的无效行情 | 证据：`if c in tencent_fill and tencent_fill[c].get('price') is not None:` | 修复建议：增加价格有效性检查`tencent_fill[c].get('price', 0) > 0`
+----- node-b:qwen/qwen3.8-27b:free [ok] 53320ms -----
+1. 高 get_quotes_eastmoney_batch:731 — data['data'] 为 None 时 .get('diff') 触发 AttributeError 崩溃 | `data.get('data', {}).get('diff', [])` — 若 API 返回 `{'data': None}`，第一个 get 返回 None 而非默认 `{}`，后续 `.get` 在 None 上调用抛出 AttributeError | 改为 `data.get('data') or {}` 再链式 get
+2. 中 get_quotes_eastmoney_batch:725 — 模块级全局 _HTTP_OPener 多线程并发 open() 非线程安全 | `_HTTP_OPENER.open(req, timeout=3)` — 数据层经 RLock 修复确认多线程共享此 opener，OpenerDirector 内部状态（handler 链/重定向）在并发写时可能损坏 | 改用 `urllib.request.urlopen()` 每次新建，或给 opener 加 threading.Lock 保护

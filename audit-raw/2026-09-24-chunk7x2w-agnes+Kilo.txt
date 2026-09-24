@@ -1,0 +1,93 @@
+
+
+############## CHUNK 1/7: 1-source-tracker+TDX (lines 39-306) ##############
+----- node-a:agnes-2.5-flash [ok] 29723ms -----
+[中] get_tdx_client:175 —— 并发竞态：多个线程同时发现 `_tdx_client is None` 后会各自创建 Client，旧实例无人引用后泄漏（无 close） | `if _tdx_client is not None:\n    return _tdx_client\n..._tdx_client = Client(host=host)` | 将 None 检查移至锁内，或创建后用原子方式发布：先局部赋值再全局赋值，并在分配前判断是否需要先 close 旧连接。
+
+[中] get_quote_tdx:274 —— 持锁执行网络 IO：`client.get_quote(code)` 是远程调用，阻塞期间所有其他调 `get_tdx_client`/`close_tdx_client` 的线程均被阻塞，高并发时等价退化为串行 | `with _tdx_lock:\n    client = get_tdx_client(host)\n    result = client.get_quote(code)` | 将锁作用域缩窄至仅保护客户端获取与状态变更，网络调用移出锁外：`with _tdx_lock: client = get_tdx_client(host)` 后 `result = client.get_quote(code)`。
+
+[中] get_quote_tdx:277-280 —— 未防御空列表：`client.get_quote` 返回 `[]` 时绕过 `not result or len(result) == 0` 的判断（Python 中 `not []` 为 True，此条实际已覆盖；但若返回非 list 的 falsy 自定义对象可能绕过），更直接的隐患是若 result 长度为 0 则 `result[0]` 抛 IndexError | `result = client.get_quote(code)\nif not result or len(result) == 0:\n    raise ValueError(...)\nq = result[0]` | 保留现有检查即可；若 `get_quote` 文档保证非 None，可简化为 `if not result:`，并在注释注明期望返回值类型，避免调用方误传。
+----- node-b:kilo-auto/free [ok] 119701ms -----
+[中] get_quote_tdx:286 —— last_price 未做 None 校验，为 None 时 `last_price - pre_close` 抛 TypeError 崩溃 | 证据：283 行 `last_price = q.last_price`，285 行只对 `pre_close` 判 `> 0`，286 行直接参与 `((last_price - pre_close) / pre_close) * 100` | 修复：在 285 行条件增加 `last_price is not None`，缺失时令 change_pct=None
+
+[中] get_quote_tdx:274-276 —— 全局 `_tdx_lock` 内执行网络 IO（新建连接 + get_quote 请求），所有取数线程完全串行化，任一节点阻塞即全局卡死 | 证据：274 行 `with _tdx_lock:` 包裹 275 行 `get_tdx_client(host)`（内含 `Client(...)` 建连）与 276 行 `client.get_quote(code)` | 修复：锁只保护 `_tdx_client`/`_current_node`/`_failed_nodes` 的读改写，网络 IO 放到锁外，连接复用与请求解耦
+
+[中] get_tdx_client:192,196 —— 节点配置缺失 'host' 键时直接 KeyError 崩溃（配置覆盖路径无校验） | 证据：192 行 `n['host'] in _failed_nodes`、196 行 `Client(host=node['host'])` 均为硬索引，未用 `.get` 也无跳过逻辑 | 修复：统一用 `n.get('host')`，缺键时记日志并跳过该节点，避免异常上抛
+
+[中] show_popup_async:262-263 —— 每次弹窗新建线程且无节流，告警风暴下线程数无界增长 | 证据：262-263 行 `threading.Thread(target=show_popup, ...).start()`，无频率限制、不复用、无队列上限 | 修复：对同源告警加时间窗节流（如 N 秒内只弹一次），或改用单个弹窗线程 + 有限队列，防止线程/子进程耗尽
+>>> SPEED | 1-source-tracker+TDX | agnes-2.5-flash=29723ms | kilo-auto/free=119701ms
+
+
+############## CHUNK 2/7: 2-parse+single-quote (lines 307-419) ##############
+----- node-a:agnes-2.5-flash [ok] 63475ms -----
+[中] get_quote:406 —— 异常捕获过宽且缺非法 source 兜底 | `except Exception:` 会吞没 KeyboardInterrupt/SystemExit/编程错误，且非 tencent/tdx 的 source 值会静默降级为 auto 逻辑 | 收窄为 `except (OSError, TimeoutError, ValueError)` 并在分支后补 `raise ValueError(f'不支持的行情源: {source}')`
+[中] get_quote_tencent:358 —— 响应流解码无防御，服务端返回非法 GBK 字节时抛出未捕获的 UnicodeDecodeError 直接崩溃 | `content = resp.read().decode('gbk')` 后直接进正则，无任何异常处理 | 用 try/except UnicodeDecodeError 包一层并转 ValueError，或加 `errors='ignore'`
+[中] resolve_name:409 —— 形参 source/host 完全死代码，默认值 'tdx' 与内部强制调用腾讯的逻辑矛盾，误导调用方 | `def resolve_name(code, source='tdx', host=None):` 内部直接 `q = get_quote_tencent(code)` 完全忽略前两个参数 | 删除无用形参，或按 source 路由到对应取价接口
+----- node-b:kilo-auto/free [ok] 108653ms -----
+[中] get_quote_tencent:358 —— `resp.read().decode('gbk')` 无异常捕获，若服务端返回非 GBK 编码（错误页/重定向/乱码）会抛 `UnicodeDecodeError` 直接崩溃，且该路径在 `get_quote` 的 auto 回退与 `resolve_name` 中均为未受保护的调用点 | `content = resp.read().decode('gbk')` | 改为 `decode('gbk', errors='replace')` 或外层 `try/except UnicodeDecodeError` 转抛 `ValueError`，与第 367-368 行的残缺判定保持一致。
+>>> SPEED | 2-parse+single-quote | agnes-2.5-flash=63475ms | kilo-auto/free=108653ms
+
+
+############## CHUNK 3/7: 3-tencent+sina-batch (lines 420-566) ##############
+----- node-a:agnes-2.5-flash [ok] 15538ms -----
+[中] get_quotes_tencent_batch:463 —— 结果集提前固化导致错配覆盖丢失 | `if orig_code not in results:` 限制每个原始代码只接受第一次匹配到的quote；后续同代码的更新quote（如API返回顺序靠后更准确的字段）或正确匹配的quote会被直接丢弃 | 改为允许覆盖已存在的条目，或在循环结束后对每个orig_code取最新/最优quote
+[中] get_quotes_tencent_batch:471 —— fallback无差别赋值引入数据污染 | `if not matched and ret_code:` 分支在精确匹配失败后将当前quote塞入第一个未被填充的原始代码，两个不同股票的match可能互相串位 | 仅在ret_code与某个orig_code精确对应时才赋值，避免跨代码错配
+[低] get_quotes_sina_batch:533 —— buy1兜底条件多余 | `if buy1 and buy1 > 0:` 中`buy1`已是float，`if buy1 > 0`即可，`and buy1`重复但不影响逻辑 | 删除`and buy1`
+----- node-b:kilo-auto/free [ok] 179747ms -----
+[高] get_quotes_tencent_batch:471-475 —— fallback 匹配逻辑错误，将 quote 随机分配给第一个未匹配的代码，完全忽略 ret_code，导致数据错配 | `results[orig_code] = quote` 在无 ret_code 校验下按 codes 顺序盲分配 | 改为按 ret_code 精确反查 codes，若 ret_code 不在 codes 中则跳过该 quote，不分配
+
+[中] get_quotes_tencent_batch:465 —— ret_code 为空字符串时 `endswith('')` 恒为 True，任何 norm_code 都会误匹配 | `norm_code.upper().endswith(ret_code.upper())` 当 ret_code='' 时对任意字符串返回 True | 在 endswith 前加 `ret_code and` 判断，或对空 ret_code 直接 continue
+
+[中] get_quotes_tencent_batch:463-469 —— code_map 为恒等映射（normalized=list(codes)），第465行的 endswith 模糊匹配可能将不同股票的数据张冠李戴 | `norm_code.upper().endswith(ret_code.upper())` 仅凭后缀匹配，如 ret_code='600000' 可同时匹配 sh600000 与 sh600001（若存在） | 优先用 `norm_code == ret_code` 精确匹配；若确需后缀匹配，应确保 codes 中无互为后缀的代码，或增加长度/前缀校验
+
+[中] get_quotes_sina_batch:518 —— code_part 仅靠前缀替换提取，若新浪返回格式变异（如缺少 var hq_str_ 前缀），code_part 将包含无关字符，导致 results 键污染 | `prefix.replace('var hq_str_', '').strip()` 无前缀校验 | 提取前先用正则 `^var hq_str_(.+)$` 校验前缀，不匹配则跳过该行
+
+[中] get_quotes_sina_batch:562 —— except (ValueError, IndexError) 静默 continue，解析失败无日志，排障困难 | `except (ValueError, IndexError): continue` | 在 except 中加 `logging.warning` 或 `print` 记录失败行及原因
+>>> SPEED | 3-tencent+sina-batch | agnes-2.5-flash=15538ms | kilo-auto/free=179747ms
+
+
+############## CHUNK 4/7: 4-sqt+eastmoney-his (lines 567-694) ##############
+----- node-a:agnes-2.5-flash [ok] 38564ms -----
+无
+----- node-b:kilo-auto/free [ok] 43837ms -----
+[中] get_quotes_tencent_sqt_batch:606 —— 空 ret_code 时 `endswith('')` 恒为 True，导致空壳行情错误匹配首个代码 | `norm_code.upper().endswith(ret_code.upper())` | 增加 `ret_code and` 前置判断，空 ret_code 直接 `continue`
+
+[中] get_quotes_tencent_sqt_batch:606 —— 松散 `endswith` 后缀匹配会张冠李戴（如 ret_code='001' 同时命中 sh000001 与 sz002001） | `norm_code.upper().endswith(ret_code.upper())` | 改为精确 `norm_code == ret_code`；确需模糊匹配时先收集候选再唯一性校验
+
+[中] get_quotes_tencent_sqt_batch:611-614 —— 回退逻辑完全不校验 ret_code，把行情乱填进第一个未命中的 orig_code | `results[orig_code] = quote` | 回退分支也应校验 `ret_code` 与 `orig_code` 匹配，不匹配则 `continue`，避免错价
+>>> SPEED | 4-sqt+eastmoney-his | agnes-2.5-flash=38564ms | kilo-auto/free=43837ms
+
+
+############## CHUNK 5/7: 5-eastmoney+get_quotes_batch (lines 695-847) ##############
+----- node-a:agnes-2.5-flash [ok] 14793ms -----
+[高] get_quotes_eastmoney_batch:752 —— 返回字典的键与调用方期望的键格式不一致导致数据被丢弃 | `results[orig_code]` 中 orig_code 形如 `'sh600000'`（含市场前缀），而 `get_quotes_batch` 后续用原始 `a_share_codes`（形如 `'600000'`）做 `c not in batch_results` 判断（行829-832），所有 code 均被视为 missing，强制触发腾讯补齐调用，东方财富结果实际被丢弃；同时 `_batch_has_valid_result`（行823）内部同理比对也会误判为"无有效结果"，进而标记 eastmoney 为失败源（行826），造成该源永久降权 | 在构建 results 时将键统一为无前缀格式（如 `results[secid] = ...`），或在上层缺失检查中对 key 做前缀剥离后再比对；修复建议：`secid = str(item.get('f12', '')); results[secid] = {...}` 并在行829的缺失检查中兼容两种键格式（如 `code_key = c.lstrip('sz').lstrip('sh')`）
+[中] get_quotes_batch:810 —— 游标读取与索引使用分处锁外，存在线程竞争导致游标跳跃 | `with _a_share_cursor_lock:` 块内只读取了 `idx` 并递增游标，但行812的 `available_sources[idx % len(...)]` 在锁**外**执行；若 `available_sources` 因外部并发修改长度变化（虽当前 `_source_available` 仅依赖屏蔽状态标记，概率低），或两线程几乎同时进入临界区读到同一 idx，会导致同一源被连续选中两次、另一源被跳过，轮询分布不均匀 | 将行812的索引解析移入锁内完成，或在锁外用 `idx` 访问一个不会在运行时动态变化的源列表；`with _a_share_cursor_lock:` 块内直接计算并保存 `cur_source`
+[中] get_quotes_batch:831-832 —— 价格字段为 None 时二次 get() 无保护，若 quote_dict 结构异常可能 AttributeError | `batch_results[c].get('price')` 对 `None` 的判断本身安全（`None` 不是 `<= 0` 会短路），但若某源返回的 quote_dict 中 'price' 值为非数字非 None 的异常类型（如空字符串 `''`），`'' <= 0` 在 Python 3 中抛 TypeError，整个 missing 列表推导崩溃，导致缺失补齐逻辑全部跳过 | 在缺失判断处改为显式类型检查：`not batch_results[c].get('price')` 已覆盖 falsy（含 None/0/''），但若 price 为非比较类型则需加 try/except 或用 `isinstance(price, (int, float)) and price > 0` 替代
+----- node-b:kilo-auto/free [ok] 92641ms -----
+[高] get_quotes_eastmoney_batch:731 —— data.get() 在 try 块之外，若 API 返回非 dict 的合法 JSON（如 null、list、string、number），data.get 将触发 AttributeError 崩溃 | `diff = data.get('data', {}).get('diff', [])` | 将该行纳入 try 块，或在调用 .get 前加 `if not isinstance(data, dict): return {}`
+>>> SPEED | 5-eastmoney+get_quotes_batch | agnes-2.5-flash=14793ms | kilo-auto/free=92641ms
+
+
+############## CHUNK 6/7: 6-kline (lines 848-988) ##############
+----- node-a:agnes-2.5-flash [ok] 15235ms -----
+无
+----- node-b:kilo-auto/free [timeout] Nonems -----
+<timeout>
+>>> SPEED | 6-kline | agnes-2.5-flash=15235ms | kilo-auto/free=Nonems
+
+
+############## CHUNK 7/7: 7-check_single/multi/main (lines 989-1244) ##############
+----- node-a:agnes-2.5-flash [ok] 25988ms -----
+[高] check_multi:1148 —— 死循环内 close_tdx_client 后无重连，后续请求必然再次失败 | `except Exception` 捕获后调用 `close_tdx_client()` 但不重连，下一次循环该 code 仍会再次触发相同异常，陷入「失败→关闭→再失败」的死循环，tdx 资源永远无法恢复
+[中] check_single:1014 —— q['price'] 未做键存在性检查，缺失字段时抛 KeyError | `price = q['price']`，若 get_quote 因网络异常返回残缺字典（如无 price 键），触发 KeyError 后虽被 except 捕获，但属于可预见的 KeyError 而非通用异常，应改为 `q.get('price')`
+[中] check_single:1019 —— q['name'] 直接索引覆盖入参 name，且无键存在性检查 | `name = q['name']` 无 `.get()` 保护，同样存在 KeyError 风险；同时无条件覆盖函数入参 name，若 q 中 name 为空字符串会导致后续打印/弹窗/name 引用全部丢失原名称信息
+[中] check_multi:1103 —— item['code'] / item['target'] 缺失键时抛 KeyError | 两个直接字典索引，配置文件任一条目缺 code 或 target 字段即崩溃式 skip（虽然被 except 捕获打印错误，但比明确的键校验差）
+----- node-b:kilo-auto/free [ok] 57172ms -----
+[高] check_multi:1103-1104 —— KeyError/TypeError：配置项缺少 'code' 或 'target' 键（或 alerts 数组元素不是 dict）时，`item['code']` / `item['target']` 在 try 块之外执行，直接崩溃且整个多股监控进程退出 | `code = item['code']` / `target = item['target']` | 将这两行移到 try 之内，或在循环开头加校验：`if not isinstance(item, dict) or 'code' not in item or 'target' not in item: continue`
+
+[中] check_multi:1130 —— 逻辑错误：`cooldown_key = f'{code}_{direction}'` 使用原始 direction 值；当 direction='both' 时，跌破和涨破共用同一个冷却键 `code_both`，60 秒内反向触发会被错误抑制（漏报） | `cooldown_key = f'{code}_{direction}'` | 冷却键应区分实际触发方向，改为 `f"{code}_{'below' if price <= target else 'above'}"`，或拆分为两个独立键
+
+[中] check_multi:1146-1149 —— 资源泄漏：`close_tdx_client()` 仅在 except 分支调用，`while True` 无 finally 保护；KeyboardInterrupt 或意外异常传播出循环时 TDX socket 未关闭 | `except Exception as e: ... close_tdx_client()` | 在 check_multi 函数体外层包 `try: ... finally: close_tdx_client()`，与 check_single 在 main 中的 finally 保持一致
+>>> SPEED | 7-check_single/multi/main | agnes-2.5-flash=25988ms | kilo-auto/free=57172ms
+
+ALL_CHUNKS_DONE
