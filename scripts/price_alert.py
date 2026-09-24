@@ -32,15 +32,31 @@ import time
 import datetime
 import subprocess
 import threading
+import urllib.request
 
 SCRIPT_DIR = None
+
+# ============================================================
+# HTTP 连接复用（模块级 opener）
+# ============================================================
+# 所有行情接口共用一个 OpenerDirector，避免每次请求重建连接、复用 TCP/TLS。
+# 注意：项目无任何第三方依赖，严禁引入 requests。
+_HTTP_OPENER = urllib.request.build_opener()
+
+# A股 ETF/基金代码家族（需 3 位小数 ×1000 存储）。
+# 提为模块级常量，便于多数据源复用；在原有家族基础上扩充了 sh56（560xxx 等新型 ETF）。
+ETF_PREFIXES = ('sh51', 'sh56', 'sz15', 'sz16', 'sh50', 'sh58')
 
 # ============================================================
 # 接口失败跟踪器（连续5次无效返回 → 屏蔽至软件重启）
 # ============================================================
 SOURCE_FAIL_COUNTS = {}      # {source_name: int}  连续失败次数
 SOURCE_DISABLED = set()      # {source_name}        被屏蔽的接口名
+SOURCE_DISABLED_TS = {}      # {source_name: float} 被屏蔽时的时间戳（用于时间衰减自动解封）
 MAX_CONSECUTIVE_FAILS = 5    # 连续失败阈值
+# 屏蔽时长(秒)：到期自动解封，避免「坏源永久不可用」直到重启。
+# 这是 M3「时间衰减」的核心：屏蔽不是永久态，而是带 TTL 的临时态。
+SOURCE_DISABLE_DURATION = 300
 
 # 为什么要加锁：计数是「读-改-写」，非原子操作。get_quotes_batch 既会被 QuoteWorker
 # 后台线程调用、也可能被 UI 线程（设置保存后）调用，并发下会丢计数，导致屏蔽判定失真。
@@ -53,27 +69,55 @@ _a_share_cursor = 0
 _a_share_cursor_lock = threading.Lock()
 
 def _source_available(name):
+    """接口是否可用：被屏蔽时检查是否过期，过期则自动解封（时间衰减）"""
     with _SOURCE_LOCK:
-        return name not in SOURCE_DISABLED
+        if name not in SOURCE_DISABLED:
+            return True
+        ts = SOURCE_DISABLED_TS.get(name, 0)
+        if time.time() - ts >= SOURCE_DISABLE_DURATION:
+            # 屏蔽到期：自动解封并清零计数，恢复正常轮询
+            SOURCE_DISABLED.discard(name)
+            SOURCE_DISABLED_TS.pop(name, None)
+            SOURCE_FAIL_COUNTS[name] = 0
+            print(f'[SourceRecover] {name} 屏蔽到期({SOURCE_DISABLE_DURATION}s)，自动解封')
+            return True
+        return False
 
 def _source_mark_success(name):
-    """接口返回有效数据 → 清零失败计数"""
+    """接口返回有效数据 → 清零失败计数，并立即解封（主动恢复）"""
     with _SOURCE_LOCK:
+        was_disabled = name in SOURCE_DISABLED
+        if was_disabled:
+            SOURCE_DISABLED.discard(name)
+            SOURCE_DISABLED_TS.pop(name, None)
+            print(f'[SourceRecover] {name} 返回有效数据，立即解封')
         SOURCE_FAIL_COUNTS[name] = 0
 
 def _source_mark_fail(name, detail=''):
-    """接口调用失败/无效 → 计数+1，达阈值则屏蔽"""
+    """接口调用失败/无效 → 计数+1，达阈值则屏蔽（记录屏蔽时间戳）
+
+    计数递增、阈值判定、屏蔽写入必须在**同一个**临界区内完成：原先分两段加锁，
+    中间窗口里并发的 _source_mark_success 可把计数清零并解封，本线程却仍按
+    过期的 cnt 把它拉黑。print 留在锁外（持锁不做 IO）。
+    """
     with _SOURCE_LOCK:
         SOURCE_FAIL_COUNTS[name] = SOURCE_FAIL_COUNTS.get(name, 0) + 1
         cnt = SOURCE_FAIL_COUNTS[name]
+        newly = False
+        if cnt >= MAX_CONSECUTIVE_FAILS and name not in SOURCE_DISABLED:
+            SOURCE_DISABLED.add(name)
+            SOURCE_DISABLED_TS[name] = time.time()
+            newly = True
     print(f'[SourceFail] {name}: 连续失败 {cnt}/{MAX_CONSECUTIVE_FAILS} {detail}')
-    if cnt >= MAX_CONSECUTIVE_FAILS:
-        with _SOURCE_LOCK:
-            newly = name not in SOURCE_DISABLED
-            if newly:
-                SOURCE_DISABLED.add(name)
-        if newly:
-            print(f'[SourceDisabled] {name} 连续{MAX_CONSECUTIVE_FAILS}次失败，已屏蔽至重启')
+    if newly:
+        print(f'[SourceDisabled] {name} 连续{MAX_CONSECUTIVE_FAILS}次失败，已屏蔽{SOURCE_DISABLE_DURATION}s')
+
+def _source_recover(name):
+    """手动/自动解封接口（时间衰减到期或主动恢复时调用）"""
+    with _SOURCE_LOCK:
+        SOURCE_DISABLED.discard(name)
+        SOURCE_DISABLED_TS.pop(name, None)
+        SOURCE_FAIL_COUNTS[name] = 0
 
 def _batch_has_valid_result(results, codes):
     """判断批量结果是否有效：至少覆盖一半的股票，且价格与涨跌幅都齐全
@@ -170,13 +214,14 @@ def get_tdx_client(host=None, nodes=None):
 def close_tdx_client():
     """关闭eltdx连接"""
     global _tdx_client, _current_node
-    if _tdx_client is not None:
-        try:
-            _tdx_client.close()
-        except Exception:
-            pass
-        _tdx_client = None
-        _current_node = None
+    with _tdx_lock:
+        if _tdx_client is not None:
+            try:
+                _tdx_client.close()
+            except Exception:
+                pass
+            _tdx_client = None
+            _current_node = None
 
 
 def get_current_node_info():
@@ -222,7 +267,10 @@ def show_popup_async(title, message):
     t.start()
 
 
-_tdx_lock = threading.Lock()
+# 必须是**可重入锁（RLock）**：get_quote_tdx 持锁后调用 get_tdx_client，
+# 后者在切换节点/首次带 host 时会调用 close_tdx_client（其内部 again `with _tdx_lock`）。
+# 若用普通 Lock，同一线程二次进入会自死锁、永久卡死取数线程。见 tests。
+_tdx_lock = threading.RLock()
 
 
 def get_quote_tdx(code, host=None):
@@ -238,7 +286,9 @@ def get_quote_tdx(code, host=None):
     pre_close = q.pre_close_price
     last_price = q.last_price
     change_pct = None
-    if pre_close and pre_close > 0:
+    # last_price 可能为 None（停牌/盘前部分 TDX 节点），pre_close 有值时会算出
+    # None - float 触发 TypeError。缺价就不算涨跌幅，交由上层显示 '--'。
+    if pre_close and pre_close > 0 and last_price is not None:
         change_pct = ((last_price - pre_close) / pre_close) * 100
 
     return {
@@ -260,6 +310,43 @@ def get_quote_tdx(code, host=None):
     }
 
 
+# ============================================================
+# 腾讯行情字段下标（统一命名常量，避免魔法数字散落三处解析逻辑）
+# ============================================================
+_TENCENT_F_NAME = 1
+_TENCENT_F_CODE = 2
+_TENCENT_F_PRICE = 3
+_TENCENT_F_YEST_CLOSE = 4
+_TENCENT_F_OPEN = 5
+_TENCENT_F_CHANGE_PCT = 32
+_TENCENT_F_HIGH = 33
+_TENCENT_F_LOW = 34
+
+
+def _parse_tencent_response(text):
+    """解析单条腾讯行情内部串（v_xxx="..." 引号内的 ~ 分隔内容）。
+
+    返回 quote dict；字段残缺（<5 段）或解析失败返回 None，由调用方决定跳过/报错。
+    单只 / 批量 / sqt 三处腾讯解析统一走这里，避免重复且易错的下标逻辑。
+    """
+    f = text.split('~')
+    if len(f) < 5:          # L9 防御：字段太少直接判残缺，杜绝 IndexError
+        return None
+    try:
+        return {
+            'name': f[_TENCENT_F_NAME],
+            'code': f[_TENCENT_F_CODE],
+            'price': float(f[_TENCENT_F_PRICE]) if f[_TENCENT_F_PRICE] else None,
+            'yest_close': float(f[_TENCENT_F_YEST_CLOSE]) if f[_TENCENT_F_YEST_CLOSE] else None,
+            'open': float(f[_TENCENT_F_OPEN]) if len(f) > _TENCENT_F_OPEN and f[_TENCENT_F_OPEN] else None,
+            'high': float(f[_TENCENT_F_HIGH]) if len(f) > _TENCENT_F_HIGH and f[_TENCENT_F_HIGH] else None,
+            'low': float(f[_TENCENT_F_LOW]) if len(f) > _TENCENT_F_LOW and f[_TENCENT_F_LOW] else None,
+            'change_pct': float(f[_TENCENT_F_CHANGE_PCT]) if len(f) > _TENCENT_F_CHANGE_PCT and f[_TENCENT_F_CHANGE_PCT] else None,
+        }
+    except (ValueError, IndexError):
+        return None
+
+
 def get_quote_tencent(code):
     """从腾讯接口获取 A 股实时行情（备用，约 155ms 延迟）
 
@@ -267,25 +354,25 @@ def get_quote_tencent(code):
     避免上层拿到结构不符的脏数据。
     """
     import urllib.request
+    import re
     if not code.lower().startswith(('sh', 'sz')):
         raise ValueError(f'腾讯接口仅支持 A 股代码(sh/sz): {code}')
 
     url = f'https://qt.gtimg.cn/q={code}'
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    with _HTTP_OPENER.open(req, timeout=5) as resp:
         content = resp.read().decode('gbk')
 
-    f = content.split('~')
-    return {
-        'name': f[1],
-        'code': f[2],
-        'price': float(f[3]),
-        'yest_close': float(f[4]),
-        'open': float(f[5]) if f[5] else None,
-        'high': float(f[33]) if len(f) > 33 and f[33] else None,
-        'low': float(f[34]) if len(f) > 34 and f[34] else None,
-        'change_pct': float(f[32]) if len(f) > 32 and f[32] else None,
-    }
+    # 单只返回形如 v_code="字段0~字段1~..."; 用与批量一致的正则提取内部串，
+    # 再走统一解析器。L9 畸形防御由 _parse_tencent_response 的残缺判定承担。
+    m = re.search(r'v_[^=]+="([^"]*)"', content)
+    if not m:
+        raise ValueError(f'腾讯返回格式异常，无法匹配行情: {code}')
+    quote = _parse_tencent_response(m.group(1))
+    # 残缺或无价格 → 抛清晰异常，避免上层拿到脏数据
+    if quote is None or quote.get('price') is None:
+        raise ValueError(f'腾讯返回字段残缺或价格无效: {code}')
+    return quote
 
 def detect_market(code):
     """识别是否为 A 股代码（含 s_ 前缀的指数写法）
@@ -352,7 +439,7 @@ def get_quotes_tencent_batch(codes):
     url = f'https://qt.gtimg.cn/q={codes_str}'
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     try:
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with _HTTP_OPENER.open(req, timeout=3) as resp:
             content = resp.read().decode('gbk')
     except Exception as e:
         print(f'[Tencent Batch] failed: {e}')
@@ -371,24 +458,9 @@ def get_quotes_tencent_batch(codes):
 
     for match_str in matches:
         f = match_str.split('~')
-        if len(f) < 5:
-            continue
-
-        # 提取返回的代码
         ret_code = f[2] if len(f) > 2 else ''
-        # A股标准格式
-        try:
-            quote = {
-                'name': f[1],
-                'code': f[2],
-                'price': float(f[3]) if f[3] else None,
-                'yest_close': float(f[4]) if f[4] else None,
-                'open': float(f[5]) if len(f) > 5 and f[5] else None,
-                'high': float(f[33]) if len(f) > 33 and f[33] else None,
-                'low': float(f[34]) if len(f) > 34 and f[34] else None,
-                'change_pct': float(f[32]) if len(f) > 32 and f[32] else None,
-            }
-        except (ValueError, IndexError) as e:
+        quote = _parse_tencent_response(match_str)
+        if quote is None:
             continue
 
         # 将结果映射回原始代码
@@ -396,7 +468,9 @@ def get_quotes_tencent_batch(codes):
         matched = False
         for orig_code, norm_code in code_map.items():
             if orig_code not in results:
-                if norm_code == ret_code or norm_code.upper().endswith(ret_code.upper()):
+                # ret_code 为空时 endswith('') 恒真，会把该 quote 误配给第一个未占用的
+                # 代码 → 名称/数据错挂。空 ret_code 直接不参与匹配。
+                if ret_code and (norm_code == ret_code or norm_code.upper().endswith(ret_code.upper())):
                     if quote.get('price') is not None:
                         results[orig_code] = quote
                         matched = True
@@ -405,7 +479,8 @@ def get_quotes_tencent_batch(codes):
         if not matched and ret_code:
             for orig_code in codes:
                 if orig_code not in results:
-                    results[orig_code] = quote
+                    if quote.get('price') is not None:
+                        results[orig_code] = quote
                     break
 
     return results
@@ -436,7 +511,7 @@ def get_quotes_sina_batch(codes):
         'Referer': 'https://finance.sina.com.cn'
     })
     try:
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with _HTTP_OPENER.open(req, timeout=3) as resp:
             text = resp.read().decode('gbk')
     except Exception as e:
         print(f'[Sina Batch] failed: {e}')
@@ -514,7 +589,7 @@ def get_quotes_tencent_sqt_batch(codes):
     url = f'https://web.sqt.gtimg.cn/q={codes_str}'
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     try:
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with _HTTP_OPENER.open(req, timeout=3) as resp:
             content = resp.read().decode('gbk')
     except Exception as e:
         print(f'[TencentSQT Batch] failed: {e}')
@@ -530,26 +605,15 @@ def get_quotes_tencent_sqt_batch(codes):
 
     for match_str in matches:
         f = match_str.split('~')
-        if len(f) < 5:
-            continue
         ret_code = f[2] if len(f) > 2 else ''
-        try:
-            quote = {
-                'name': f[1],
-                'code': f[2],
-                'price': float(f[3]) if f[3] else None,
-                'yest_close': float(f[4]) if f[4] else None,
-                'open': float(f[5]) if len(f) > 5 and f[5] else None,
-                'high': float(f[33]) if len(f) > 33 and f[33] else None,
-                'low': float(f[34]) if len(f) > 34 and f[34] else None,
-                'change_pct': float(f[32]) if len(f) > 32 and f[32] else None,
-            }
-        except (ValueError, IndexError):
+        quote = _parse_tencent_response(match_str)
+        if quote is None:
             continue
         matched = False
         for orig_code, norm_code in code_map.items():
             if orig_code not in results:
-                if norm_code == ret_code or norm_code.upper().endswith(ret_code.upper()):
+                # 同 get_quotes_tencent_batch：空 ret_code 不参与匹配，避免误配错挂
+                if ret_code and (norm_code == ret_code or norm_code.upper().endswith(ret_code.upper())):
                     if quote.get('price') is not None:
                         results[orig_code] = quote
                         matched = True
@@ -557,7 +621,8 @@ def get_quotes_tencent_sqt_batch(codes):
         if not matched and ret_code:
             for orig_code in codes:
                 if orig_code not in results:
-                    results[orig_code] = quote
+                    if quote.get('price') is not None:
+                        results[orig_code] = quote
                     break
     return results
 
@@ -582,8 +647,6 @@ def get_quotes_eastmoney_his_batch(codes):
     if not secid_map:
         return {}
 
-    ETF_PREFIXES = ('sh51', 'sz15', 'sz16', 'sh50', 'sh58')
-
     def _scale_for(code_lower):
         """ETF/基金价格需3位小数用×1000存储，其他股票2位小数用×100"""
         return 1000 if code_lower.startswith(ETF_PREFIXES) else 100
@@ -606,7 +669,7 @@ def get_quotes_eastmoney_his_batch(codes):
             'Referer': 'https://quote.eastmoney.com/'
         })
         try:
-            with urllib.request.urlopen(req, timeout=3) as resp:
+            with _HTTP_OPENER.open(req, timeout=3) as resp:
                 data = _json.loads(resp.read().decode('utf-8'))
             d = data.get('data') or {}
             if not d:
@@ -670,13 +733,17 @@ def get_quotes_eastmoney_batch(codes):
         'Referer': 'https://quote.eastmoney.com/'
     })
     try:
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with _HTTP_OPENER.open(req, timeout=3) as resp:
             data = _json.loads(resp.read().decode('utf-8'))
     except Exception as e:
         print(f'[EastMoney Batch] failed: {e}')
         return {}
 
-    diff = data.get('data', {}).get('diff', [])
+    # 东财坏请求时常返回 {"data": null}——.get('data', {}) 会拿到 None 再 .get 抛
+    # AttributeError（此行在上面的 try 之外）。用 `or {}` + 顶层类型守卫。
+    if not isinstance(data, dict):
+        return {}
+    diff = (data.get('data') or {}).get('diff', [])
     if not diff:
         return {}
 
@@ -778,7 +845,8 @@ def get_quotes_batch(codes, source='auto', host=None):
                    if c not in batch_results
                    or not batch_results[c].get('price')
                    or batch_results[c].get('price') <= 0]
-        if missing:
+        # 补齐前先确认 tencent 未被屏蔽（M3 永久态），否则对已知坏源重试只会拖慢补齐
+        if missing and _source_available('tencent'):
             try:
                 tencent_fill = get_quotes_tencent_batch(missing)
             except Exception:
@@ -832,7 +900,7 @@ def _get_kline_tencent(code, count=60, period='1min'):
 
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with _HTTP_OPENER.open(req, timeout=5) as resp:
             payload = _json.loads(resp.read().decode('utf-8'))
         rows = (payload.get('data', {}).get(code, {}) or {}).get(kind) or []
     except Exception as e:
@@ -896,13 +964,17 @@ def _get_kline_eastmoney(code, count=60, period='1min'):
     )
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     try:
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with _HTTP_OPENER.open(req, timeout=3) as resp:
             data = _json.loads(resp.read().decode('utf-8'))
     except Exception as e:
         print(f'[KLine EastMoney] failed: {e}')
         return []
 
-    klines = data.get('data', {}).get('klines', [])
+    # 同东财批量：坏请求返回 {"data": null}，.get('data', {}) 得到 None 再 .get 抛
+    # AttributeError。`or {}` + 顶层守卫兜住。
+    if not isinstance(data, dict):
+        return []
+    klines = (data.get('data') or {}).get('klines', [])
     if not klines:
         return []
 
@@ -1028,7 +1100,7 @@ def check_multi(config_file, source='tdx', host=None, notify='popup'):
         config = json.load(f)
 
     interval = config.get('interval', 5)
-    log_file = config.get('log', get_log_path('multi'))
+    log_file = config.get('log') or get_log_path('multi')  # 空串也视为未配置，避免 open('') OSError
     items = config.get('alerts', [])
 
     source_label = f'TDX({host or DEFAULT_TDX_HOST})' if source == 'tdx' else 'Tencent'
@@ -1047,6 +1119,11 @@ def check_multi(config_file, source='tdx', host=None, notify='popup'):
         now_str = datetime.datetime.now().strftime('%H:%M:%S')
 
         for item in items:
+            # 字段读取在 try 之外：配置项缺 code/target 或不是 dict 时 KeyError 会直接
+            # 崩掉整个监控循环（后续股票再也不检查）。先校验、坏项跳过。
+            if not isinstance(item, dict) or 'code' not in item or 'target' not in item:
+                print(f'[{now_str}] 跳过无效配置项: {item!r}')
+                continue
             code = item['code']
             target = item['target']
             direction = item.get('dir', 'below')
@@ -1064,17 +1141,22 @@ def check_multi(config_file, source='tdx', host=None, notify='popup'):
 
                 triggered = False
                 reason = ''
+                hit_dir = ''
 
                 if alert_below and price <= target:
                     triggered = True
                     reason = f'{name}({code}) 跌破 {target} | 当前: {price:.2f}'
+                    hit_dir = 'below'
                 if alert_above and price >= target:
                     triggered = True
                     reason = f'{name}({code}) 涨破 {target} | 当前: {price:.2f}'
+                    hit_dir = 'above'
 
                 if triggered:
                     # 冷却检查
-                    cooldown_key = f'{code}_{direction}'
+                    # 按**实际触发方向**作键：direction='both' 时用同一个 `{code}_both`
+                    # 键会让跌破/涨破互相压制 60s，漏掉另一侧预警。
+                    cooldown_key = f'{code}_{hit_dir or direction}'
                     last_alert_time = alert_cooldown.get(cooldown_key, 0)
                     current_time = time.time()
 
