@@ -42,10 +42,15 @@ Windows 11 桌面 **A 股 + 美股** 监控悬浮窗：无边框、置顶、半�
 | Windows 10/11 | `StockMonitor.exe` | 双击运行 |
 | Ubuntu 22.04 / 24.04 / WSL | `StockMonitor-linux-x64.tar.gz` | 解压后 `./StockMonitor` 运行 |
 
-Ubuntu 首次运行前需安装 Qt 运行所需系统库（一次性）：
+Ubuntu 首次运行前需安装 Qt 运行所需系统库（一次性；桌面版通常缺 libxcb-cursor0，WSL/minimal 还缺 GL/EGL）：
 
 ```bash
-sudo apt-get install -y libxcb-cursor0 libxkbcommon-x11-0
+sudo apt-get install -y \
+  libegl1 libgl1 libdbus-1-3 \
+  libxkbcommon0 libxkbcommon-x11-0 \
+  libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 \
+  libxcb-shape0 libxcb-randr0 libxcb-render-util0 \
+  libxcb-xinerama0 libxcb-xkb1
 tar -xzf StockMonitor-linux-x64.tar.gz
 chmod +x StockMonitor
 ./StockMonitor

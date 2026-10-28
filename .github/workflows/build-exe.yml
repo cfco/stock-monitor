@@ -75,12 +75,22 @@ jobs:
         with:
           python-version: '3.12'
 
-      # PySide6 的 xcb 平台插件在运行时需要这些系统库；
+      # PySide6 的 Qt 图形栈在 Linux 上需要的系统库：
+      #   libegl1/libgl1   —— libQt6Gui 直接链接（缺 libEGL.so.1 会在 import QtGui 时崩）
+      #   libxcb-* 系列    —— xcb 平台插件的运行依赖
+      #   libxkbcommon*    —— 键盘映射
+      #   libdbus-1-3      —— QtNetwork/桌面集成
       # xvfb 用于无显示环境下做启动冒烟测试
       - name: Install system libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxcb-cursor0 libxkbcommon-x11-0 xvfb
+          sudo apt-get install -y \
+            libegl1 libgl1 libdbus-1-3 \
+            libxkbcommon0 libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 \
+            libxcb-shape0 libxcb-randr0 libxcb-render-util0 \
+            libxcb-xinerama0 libxcb-xkb1 \
+            xvfb
 
       - name: Install dependencies
         run: |
