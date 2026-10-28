@@ -2,12 +2,15 @@
 """
 floating_window.py — Stock Monitor 桌面悬浮窗 v5.0
 PySide6 原生 Win11 风格悬浮窗：无边框、置顶、半透明、可拖拽
-复用 price_alert.py 的数据获取逻辑（纯 A 股）
+数据获取复用 price_alert.py（A股）+ alpaca_*.py（美股 Alpaca 免费版）：
+  - A股：五路免费接口轮询（腾讯/新浪/东方财富/通达信）
+  - 美股：实时=WebSocket 推送（alpaca_stream），历史K线/休市兜底=REST（alpaca_history）
 紧凑版：1/3 宽度，支持目标价 + 单日涨跌% 双预警
 """
 
 import os
 import sys
+import re
 import json
 import time
 import datetime
@@ -33,6 +36,37 @@ def _data_dir():
 
 sys.path.insert(0, os.path.join(_resource_dir(), 'scripts'))
 from price_alert import close_tdx_client, get_quotes_batch, get_kline_1min
+# 美股（Alpaca 免费版）：实时=WebSocket（alpaca_stream），历史/兜底=REST（alpaca_history）
+import alpaca_history
+import alpaca_stream
+import secret_store          # 本地凭证 DPAPI 加密（Alpaca Key/Secret）
+
+
+# 美股代码规则：1-5 位字母，可带类股后缀（如 AAPL / BRK.B）
+_US_SYMBOL_RE = re.compile(r'^[A-Za-z]{1,5}(\.[A-Za-z]{1,2})?$')
+
+
+def normalize_us_symbol(code):
+    """把输入归一化为 Alpaca 美股代码；非美股返回空串
+
+    规则：
+      - 直接匹配 1-5 位字母（AAPL、USB、BRK.B）→ 大写返回
+      - 支持腾讯式 us 前缀写法（usAAPL → AAPL）：整体不匹配时剥掉 us 前缀再试
+      - A 股代码（sh/sz/bj + 数字）含数字，天然不匹配本规则，不会误判
+    """
+    c = (code or '').strip()
+    if not c:
+        return ''
+    if _US_SYMBOL_RE.match(c):
+        return c.upper()
+    if c[:2].lower() == 'us' and _US_SYMBOL_RE.match(c[2:]):
+        return c[2:].upper()
+    return ''
+
+
+def is_us_symbol(code):
+    """判断是否为美股代码（行情分流 / 货币符号 / 市场标签共用的单一判定入口）"""
+    return bool(normalize_us_symbol(code))
 
 from PySide6.QtCore import Qt, QThread, Signal, QPoint, QRect, QTimer, QSize
 from PySide6.QtGui import (
@@ -45,7 +79,7 @@ from PySide6.QtWidgets import (
     QPushButton, QFrame, QGraphicsDropShadowEffect, QScrollArea,
     QMessageBox, QSizePolicy,
     QDialog, QLineEdit, QComboBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QFormLayout, QGroupBox, QSpinBox,
+    QHeaderView, QFormLayout, QGroupBox, QSpinBox, QCheckBox,
     QSystemTrayIcon, QMenu,
 )
 
@@ -198,6 +232,12 @@ def load_config():
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8-sig') as f:
             config = json.load(f)
+        # 旧版明文凭证 → DPAPI 密文迁移（幂等；有变更才落盘一次）
+        try:
+            if secret_store.migrate_config(config):
+                save_config(config)
+        except Exception as e:
+            print(f'[Config] 凭证迁移失败(不影响启动): {e}')
         # 处理TDX节点配置
         custom_nodes = config.get('tdx_nodes')
         if custom_nodes and isinstance(custom_nodes, list):
@@ -254,6 +294,7 @@ class QuoteWorker(QThread):
         self.kline_cache = {}       # {code: (timestamp, klines)} 1分钟; {code_daily/weekly: ...} 日K/周K
         self._kline_lock = threading.Lock()  # 保护 kline_cache 跨线程读写
         self._kline_fetching = False
+        self._us_kline_fetching = False   # 美股 1 分钟 K 线预取标志（与 A 股互不阻塞）
         self._kline_period_fetching = False
         self._first_loop = True     # 首次循环标记（启动时无论是否交易时间都请求一次，避免空白）
 
@@ -297,16 +338,21 @@ class QuoteWorker(QThread):
             fetch_start = time.time()
             valid_codes = [item.get('code', '') for item in alerts if item.get('code')]
 
-            # A股交易时间外不刷新行情（首次启动除外，避免空白）
-            if valid_codes:
-                should_fetch = is_first_loop or is_a_share_trading_time()
-            else:
-                should_fetch = False
+            # 按市场分流：非美股走 A 股五路轮询，美股走 Alpaca（WS 缓存优先，REST 兜底）
+            a_codes = [c for c in valid_codes if not is_us_symbol(c)]
+            us_codes = [c for c in valid_codes if is_us_symbol(c)]
 
-            if should_fetch:
-                results = get_quotes_batch(valid_codes, source)
-            else:
-                results = {}
+            results = {}
+            # A股交易时间外不刷新行情（首次启动除外，避免空白）
+            if a_codes and (is_first_loop or is_a_share_trading_time()):
+                results.update(get_quotes_batch(a_codes, source))
+            if us_codes:
+                # 美股每轮都取：交易时段读 WS 内存缓存（零网络开销），
+                # 休市时段走 REST，REST 内部有 60s TTL 节流，不会浪费免费版配额
+                try:
+                    results.update(alpaca_stream.get_quotes_batch(us_codes))
+                except Exception as e:
+                    print(f'[Alpaca] 美股取数异常: {e}')
             self._first_loop = False
 
             # 串行处理结果
@@ -405,10 +451,9 @@ class QuoteWorker(QThread):
             # 非交易时间跳过1分钟K线刷新（首次启动除外，避免空白）
             if not self._kline_fetching and (is_first_loop or is_a_share_trading_time()):
                 self._kline_fetching = True
-                a_codes = [item.get('code', '') for item in alerts if item.get('code')]
                 codes_to_fetch = []
                 now_ts = time.time()
-                for c in a_codes:
+                for c in a_codes:  # 仅 A 股（美股走下方独立预取，门控不同）
                     last_ts = (self._kline_get(c) or (0, []))[0]
                     if now_ts - last_ts > 30:
                         codes_to_fetch.append(c)
@@ -417,6 +462,21 @@ class QuoteWorker(QThread):
                     t.start()
                 else:
                     self._kline_fetching = False
+
+            # 美股1分钟K线异步预取（Alpaca 数据窗口 ET 04:00-20:00 内每 30s 刷新；
+            # 休市时数据不变，不重复拉取，悬浮图直接用既有缓存）
+            if us_codes and not self._us_kline_fetching \
+                    and (is_first_loop or alpaca_history.in_us_data_window()):
+                codes_to_fetch = []
+                now_ts = time.time()
+                for c in us_codes:
+                    last_ts = (self._kline_get(c) or (0, []))[0]
+                    if now_ts - last_ts > 30:
+                        codes_to_fetch.append(c)
+                if codes_to_fetch:
+                    self._us_kline_fetching = True
+                    t = threading.Thread(target=self._fetch_us_klines, args=(codes_to_fetch,), daemon=True)
+                    t.start()
 
             # 日K/周K 异步预加载（启动时全刷；之后距上次预加载 > 60min 即刷新）
             # 不再以「是否交易时间」为硬性门控：交易时间内按此门控正常刷新，
@@ -457,7 +517,10 @@ class QuoteWorker(QThread):
                 if not self.running:
                     break
                 try:
-                    klines = get_kline_1min(code, 60)
+                    # 分时全天化：拉当天全部1分钟K线（A股240根+缓冲），
+                    # latest_day_only 按最后一根日期过滤出同一交易日，
+                    # 得到"开盘至当前"的完整数据，而不是只看最近60根
+                    klines = get_kline_1min(code, 300, latest_day_only=True)
                     if klines:
                         self._kline_put(code, klines)
                 except Exception as e:
@@ -465,15 +528,34 @@ class QuoteWorker(QThread):
         finally:
             self._kline_fetching = False
 
+    def _fetch_us_klines(self, codes):
+        """后台线程: 获取美股1分钟K线并缓存（Alpaca REST，feed=iex）"""
+        try:
+            for code in codes:
+                if not self.running:
+                    break
+                try:
+                    klines = alpaca_history.get_kline(code, '1min', 60)
+                    if klines:
+                        self._kline_put(code, klines)
+                except Exception as e:
+                    print(f'[US Kline Prefetch] {code} failed: {e}')
+        finally:
+            self._us_kline_fetching = False
+
     def _fetch_kline_period(self, code_period_pairs):
-        """后台线程: 获取日K/周K并缓存（启动时+每小时刷新）"""
+        """后台线程: 获取日K/周K并缓存（启动时+每小时刷新），按市场分流"""
         try:
             from price_alert import get_kline
             for code, period in code_period_pairs:
                 if not self.running:
                     break
                 try:
-                    klines = get_kline(code, period, 60)
+                    # 美股走 Alpaca，A股走东方财富/腾讯；日K预取顺带更新美股昨收缓存
+                    if is_us_symbol(code):
+                        klines = alpaca_history.get_kline(code, period, 60)
+                    else:
+                        klines = get_kline(code, period, 60)
                     if klines:
                         cache_key = f'{code}_{period}'
                         self._kline_put(cache_key, klines)
@@ -561,23 +643,47 @@ class _ScreenColorDetector:
 # K线悬浮图
 # ============================================================
 class KlineTooltip(QWidget):
-    """K线悬浮图窗口（无边框、置顶、鼠标穿透）"""
+    """K线悬浮图窗口（无边框、置顶、可接收鼠标）
 
-    def __init__(self, size_key='small'):
+    鼠标交互（为什么不再穿透）：
+      图为大尺寸时会大面积悬在悬浮窗外的桌面上，穿透状态下用户对着图
+      双击时点击落到桌面，应用毫无反应 —— 即"双击关不掉"的根源。
+      改为可接收鼠标后：
+        - 双击图 = 双击悬浮窗，关闭整个应用（走主窗口 closeEvent 完整清理）
+        - 鼠标移出图 → 自动隐藏（与卡片悬停行为衔接）
+        - 单击不做任何事（不抢焦点，不改变显示状态）
+    """
+
+    def __init__(self, size_key='small', main_window=None):
         super().__init__()
         self.setWindowFlags(
             Qt.FramelessWindowHint
             | Qt.WindowStaysOnTopHint
             | Qt.Tool
+            | Qt.WindowDoesNotAcceptFocus   # 点击图时不抢主窗口焦点
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        # 主窗口引用用于双击关闭；下划线前缀，避免被外部遍历
+        self._main_window = main_window
         w, h = KLINE_SIZES.get(size_key, KLINE_SIZES['small'])
         self.setFixedSize(w, h)
 
         self.code = ''
         self.name = ''
         self.klines = []
+
+    def mouseDoubleClickEvent(self, event):
+        """双击K线图 = 关闭整个应用（与双击悬浮窗本体等效）"""
+        if event.button() == Qt.LeftButton and self._main_window is not None:
+            event.accept()
+            self._main_window.close()
+        else:
+            super().mouseDoubleClickEvent(event)
+
+    def leaveEvent(self, event):
+        """鼠标离开K线图: 自动隐藏"""
+        self.hide()
+        super().leaveEvent(event)
 
     def set_data(self, code, name, klines):
         self.code = code
@@ -644,9 +750,12 @@ class KlineTooltip(QWidget):
         h = self.height() - 42
 
         n = len(self.klines)
-        bar_w = max(2, (w - n) // n)
-        gap = 1
-        step = bar_w + gap
+        # 浮点步长全量压缩：分时已是当天全量数据(~240根)，原先固定
+        # 2px蜡烛+1px间隔在 small(320px) 宽度下只能画 ~100 根，画不下全天。
+        # 改为步长 = 绘制区宽 / n 自适应，蜡烛宽度最小压到 1px；
+        # 少量数据（日K/周K 60根）时步长变大，蜡烛自动变宽，行为与原先一致
+        step = w / n if n else 1.0
+        bar_w = max(1, int(step) - 1)
 
         # 价格范围
         max_price = max(k['high'] for k in self.klines)
@@ -660,8 +769,8 @@ class KlineTooltip(QWidget):
 
         # 画K线
         for i, k in enumerate(self.klines):
-            x = x0 + i * step
-            open_y = price_to_y(k['open'])
+            x = x0 + int(i * step)          # 浮点步长取整落位，保证最后
+            open_y = price_to_y(k['open'])   # 一根不越出右边界
             close_y = price_to_y(k['close'])
             high_y = price_to_y(k['high'])
             low_y = price_to_y(k['low'])
@@ -831,14 +940,23 @@ class QuoteCard(QFrame):
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        """鼠标离开卡片: 取消请求并隐藏K线图和按钮"""
+        """鼠标离开卡片: 取消请求并隐藏K线图和按钮
+
+        特例: 光标已移入K线悬浮图矩形内时保持图显示 —— 否则图会在鼠标
+        移向它的瞬间随本事件消失，"双击K线图关闭应用"永远点不到。
+        鼠标离开图时由 KlineTooltip.leaveEvent 自行隐藏。
+        """
         # 离开时关闭 WA_Hover，hover 开销只在悬停期间承担
         self.setAttribute(Qt.WA_Hover, False)
         self._hover_timer.stop()
         for btn in self._period_buttons.values():
             btn.setVisible(False)
         win = self.window()
-        if hasattr(win, 'hide_kline_tooltip'):
+        tip = getattr(win, '_kline_tooltip', None)
+        if tip is not None and tip.isVisible() \
+                and tip.frameGeometry().contains(QCursor.pos()):
+            pass    # 光标进入K线图区域，图保持显示
+        elif hasattr(win, 'hide_kline_tooltip'):
             win.hide_kline_tooltip()
         super().leaveEvent(event)
 
@@ -940,8 +1058,8 @@ class QuoteCard(QFrame):
             self.name = name
             self._update_name_elided()
 
-        # 货币符号：项目已收敛为纯 A 股，固定人民币
-        currency_symbol = '¥'
+        # 货币符号：A股显示人民币，美股显示美元
+        currency_symbol = '$' if is_us_symbol(self.code) else '¥'
 
         if price is not None:
             # ETF（510开头）和部分基金需要3位小数，其他股票2位
@@ -996,8 +1114,8 @@ class QuoteCard(QFrame):
         elif not triggered and self._triggered:
             self._apply_default_style()
 
-        # 市场标签：项目只支持 A 股，固定显示「A」
-        self.market_label.setText('A')
+        # 市场标签：A股显示「A」，美股显示「US」
+        self.market_label.setText('US' if is_us_symbol(self.code) else 'A')
         self.market_label.setStyleSheet(
             f'color: {get_color("text_dim")}; font-size: 9px;'
             f'border: 1px solid {get_color("border")}; border-radius: 2px;'
@@ -1045,10 +1163,18 @@ class _StockResolveThread(QThread):
             text = self.input_text.strip()
             lower_text = text.lower()
 
+            # 美股代码（含 usAAPL 写法）：名称从 Alpaca assets 接口解析，失败留空由用户自填
+            us_sym = normalize_us_symbol(text)
+            if us_sym:
+                name = ''
+                try:
+                    name = alpaca_history.get_symbol_name(us_sym)
+                except Exception:
+                    name = ''
+                candidates = [(us_sym, name)]
+
             # 已带前缀
-            if lower_text.startswith(('sh', 'sz', 'hk', 'us', 'bj')):
-                if lower_text.startswith('us') and text[2:].islower():
-                    text = 'us' + text[2:].upper()
+            elif lower_text.startswith(('sh', 'sz', 'hk', 'bj')):
                 try:
                     q = get_quote_tencent(text)
                     name = q.get('name', '')
@@ -1080,6 +1206,55 @@ class _StockResolveThread(QThread):
             print(f'[StockResolveThread] error: {e}\n{traceback.format_exc()}')
 
         self.finished_resolve.emit(candidates)
+
+
+# ============================================================
+# Alpaca 凭证弹窗（勾选「启用美股」时才出现，设置页不显示账号信息）
+# ============================================================
+class AlpacaCredsDialog(QDialog):
+    """Alpaca API Key/Secret 输入弹窗
+
+    - 预填本地已存凭证（解密回填；Secret 密文回显下看不到内容，直接点确定即沿用旧凭证）
+    - 确定 → accept，调用方把凭证加密写进内存配置（随「保存」落盘）
+    - 取消 → reject，调用方回滚勾选状态
+    """
+
+    def __init__(self, parent=None, api_key='', secret=''):
+        super().__init__(parent)
+        self.setWindowTitle('Alpaca 凭证')
+        self.setMinimumWidth(400)
+
+        layout = QVBoxLayout(self)
+        tip = QLabel(
+            '输入 Alpaca API Key / Secret（免费版即可，paper 账户）。\n'
+            '凭证经 Windows DPAPI 加密后仅保存在本机配置文件，不会明文落盘。'
+        )
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+
+        form = QFormLayout()
+        self.key_edit = QLineEdit(api_key)
+        self.key_edit.setPlaceholderText('Alpaca API Key ID')
+        form.addRow('API Key:', self.key_edit)
+        self.secret_edit = QLineEdit(secret)
+        self.secret_edit.setEchoMode(QLineEdit.Password)
+        self.secret_edit.setPlaceholderText('Alpaca Secret Key')
+        form.addRow('Secret:', self.secret_edit)
+        layout.addLayout(form)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        ok_btn = QPushButton('确定')
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton('取消')
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(ok_btn)
+        btns.addWidget(cancel_btn)
+        layout.addLayout(btns)
+
+    def get_creds(self):
+        """返回 (api_key, secret) 的去空格输入值"""
+        return self.key_edit.text().strip(), self.secret_edit.text().strip()
 
 
 # ============================================================
@@ -1166,6 +1341,15 @@ class SettingsDialog(QDialog):
         self.tdx_host_edit.setText(self.config.get('tdx_host', ''))
         self.tdx_host_edit.setPlaceholderText('留空使用默认节点')
         top_form.addRow('TDX服务器:', self.tdx_host_edit)
+
+        # Alpaca（美股）配置区：设置页不显示任何账号信息；
+        # 勾选启用时才弹窗输入凭证（DPAPI 加密存本地），取消勾选不清除已存凭证。
+        # 注意：必须先 setChecked 再连 toggled，否则已启用状态下每次打开设置都会弹窗
+        alc_cfg = self.config.get('alpaca') or {}
+        self.us_enable_check = QCheckBox('启用美股（夜盘实时 WS + REST 历史K线）')
+        self.us_enable_check.setChecked(bool(alc_cfg.get('enabled')))
+        self.us_enable_check.toggled.connect(self._on_us_enable_toggled)
+        top_form.addRow('美股:', self.us_enable_check)
         layout.addWidget(top_box)
 
         # 表格
@@ -1346,8 +1530,8 @@ class SettingsDialog(QDialog):
         if not code:
             return
 
-        # 已带前缀的不再重复查询
-        if code.lower().startswith(('sh', 'sz', 'hk', 'us', 'bj')):
+        # 已带前缀的不再重复查询（美股不带前缀，需走解析线程补名称）
+        if code.lower().startswith(('sh', 'sz', 'hk', 'bj')):
             return
 
         name_item = self.table.item(row, 1)
@@ -1402,6 +1586,38 @@ class SettingsDialog(QDialog):
                 name_item.setText(chosen[1] or '')
             self._block_signals = False
 
+    def _on_us_enable_toggled(self, checked):
+        """「启用美股」勾选联动
+
+        - 勾选：弹凭证窗，预填本地已存凭证（解密回填）；确定 → 加密写入内存配置，
+          随「保存」落盘；取消/留空 → 回滚勾选为未启用
+        - 取消勾选：什么都不做（凭证保留，下次再勾选弹窗仍预填旧值可继续用）
+        """
+        if not checked:
+            return
+        alc = self.config.get('alpaca')
+        if not isinstance(alc, dict):
+            alc = {}
+            self.config['alpaca'] = alc
+        key, secret = secret_store.load_alpaca_creds(alc)
+        dlg = AlpacaCredsDialog(self, key, secret)
+        if dlg.exec() == QDialog.Accepted:
+            k, s = dlg.get_creds()
+            if not k or not s:
+                QMessageBox.warning(self, '凭证不完整', 'API Key 和 Secret 都不能为空。')
+                self._set_us_check_silent(False)
+                return
+            # DPAPI 加密写入内存段（点「保存」时随其它设置一起写盘）
+            secret_store.store_alpaca_creds(alc, k, s)
+        else:
+            self._set_us_check_silent(False)
+
+    def _set_us_check_silent(self, checked):
+        """回滚复选框状态但不触发 toggled（避免再次弹窗）"""
+        self.us_enable_check.blockSignals(True)
+        self.us_enable_check.setChecked(checked)
+        self.us_enable_check.blockSignals(False)
+
     def _save_and_close(self):
         alerts = []
         for row in range(self.table.rowCount()):
@@ -1417,13 +1633,17 @@ class SettingsDialog(QDialog):
             code = code_item.text().strip() if code_item else ''
             if not code:
                 continue
-            # 保存时校验 A 股格式，避免脏代码入库（取数时会被静默忽略，
-            # 且与 README「非 A 股代码会被拒绝」口径一致）
+            # 保存时校验代码格式（A股 或 美股），避免脏代码入库（取数时会被静默忽略）
             c_low = code.lower()
-            if not (c_low[:2] in ('sh', 'sz', 'bj') and c_low[2:].isdigit() and len(c_low) == 8):
+            is_a_format = (c_low[:2] in ('sh', 'sz', 'bj') and c_low[2:].isdigit() and len(c_low) == 8)
+            if is_a_format:
+                pass
+            elif is_us_symbol(code):
+                code = normalize_us_symbol(code)   # 美股统一存大写（AAPL / BRK.B）
+            else:
                 QMessageBox.warning(
                     self, '代码格式错误',
-                    f'「{code}」不是合法的 A 股代码（应为 sh/sz/bj + 6 位数字），已跳过',
+                    f'「{code}」不是合法代码（A股: sh/sz/bj + 6位数字；美股: 1-5位字母如 AAPL），已跳过',
                 )
                 continue
 
@@ -1468,6 +1688,11 @@ class SettingsDialog(QDialog):
         # 必须一并保存：start_monitor() 会读 config['tdx_host'] 覆盖 price_alert 的节点表，
         # 漏存则界面上填的自定义 TDX 服务器每次重启都丢失（原先就是这个问题）
         self.config['tdx_host'] = self.tdx_host_edit.text().strip()
+        # Alpaca：只同步开关状态。凭证由勾选时的弹窗加密写入（api_key_enc/secret_enc），
+        # 这里不能重建整个 alpaca 段，否则会把密文凭证字段覆盖丢失
+        if not isinstance(self.config.get('alpaca'), dict):
+            self.config['alpaca'] = {}
+        self.config['alpaca']['enabled'] = self.us_enable_check.isChecked()
         self.config['alerts'] = alerts
 
         if save_config(self.config):
@@ -1481,6 +1706,9 @@ class SettingsDialog(QDialog):
 # 主悬浮窗（1/3 宽度）
 # ============================================================
 class FloatingWindow(QWidget):
+    # 美股名称后台补全结果：后台线程不能直接改 UI，统一经此信号回主线程
+    us_name_backfilled = Signal(str, str)   # (code, name)
+
     def __init__(self):
         super().__init__()
         self.config = load_config()
@@ -1491,6 +1719,7 @@ class FloatingWindow(QWidget):
         self._kline_tooltip = None
         self._kline_fetcher = None
         self._settings_dialog = None
+        self.us_name_backfilled.connect(self._on_us_name_backfilled)
 
         # 系统托盘
         self._tray_icon = None
@@ -1819,6 +2048,71 @@ class FloatingWindow(QWidget):
         if was_running:
             self.start_monitor()
 
+    def _apply_alpaca_config(self):
+        """把 Alpaca 配置注入数据层，并按监控列表启停 WebSocket 线程
+
+        启动与「设置保存」两条路径都经过这里，保证凭证/订阅列表变更即时生效。
+        """
+        alc = self.config.get('alpaca') or {}
+        # 凭证从密文字段解密后只进内存（alpaca_history 模块级），不打印到任何日志
+        key, secret = secret_store.load_alpaca_creds(alc)
+        alpaca_history.configure(key, secret)
+        us_codes = [
+            normalize_us_symbol(item.get('code', ''))
+            for item in self.config.get('alerts', [])
+        ]
+        us_codes = [c for c in us_codes if c]
+        if alc.get('enabled') and us_codes:
+            alpaca_stream.ensure_started(us_codes)
+        else:
+            alpaca_stream.stop()
+
+    def _backfill_us_names(self):
+        """后台给名称为空的美股代码自动补名称
+
+        场景：设置里直接输 AAPL 时，若凭证还没配置好（或 assets 端点当时不可用），
+        名称解析会留空并保存；凭证生效后由本方法兜底补全，免去用户手动重输代码。
+        """
+        if not alpaca_history.has_credentials():
+            print('[Alpaca] 名称补全跳过：未配置凭证')
+            return
+        todo = [
+            item.get('code')
+            for item in self.config.get('alerts', [])
+            if is_us_symbol(item.get('code', '')) and not item.get('name')
+        ]
+        todo = list(dict.fromkeys(todo))          # 去重保序
+        print(f'[Alpaca] 名称补全检查: 待补={todo}')
+        if not todo:
+            return
+
+        def work():
+            for code in todo:
+                try:
+                    name = alpaca_history.get_symbol_name(code)
+                except Exception as e:
+                    print(f'[Alpaca] 名称补全异常 {code}: {e}')
+                    name = ''
+                print(f'[Alpaca] 名称补全 {code} -> {name!r}')
+                if name:
+                    self.us_name_backfilled.emit(code, name)
+
+        threading.Thread(target=work, daemon=True, name='us-name-backfill').start()
+
+    def _on_us_name_backfilled(self, code, name):
+        """补名结果（主线程执行）：写配置 + 落盘 + 刷新卡片名称显示"""
+        changed = False
+        for item in self.config.get('alerts', []):
+            if item.get('code') == code and not item.get('name'):
+                item['name'] = name
+                changed = True
+        if changed:
+            save_config(self.config)
+        card = self.cards.get(code)
+        if card:
+            card.name = name
+            card._update_name_elided()
+
     def start_monitor(self):
         if self.worker and self.worker.isRunning():
             return
@@ -1831,7 +2125,11 @@ class FloatingWindow(QWidget):
                 {'id': 'custom', 'name': f'自定义({tdx_host})', 'host': tdx_host, 'priority': 1}
             ]
             price_alert.DEFAULT_TDX_HOST = tdx_host
+        # 美股（Alpaca）：注入凭证 + 启动实时 WebSocket（历史K线由 REST 按需拉取）
+        self._apply_alpaca_config()
         self._rebuild_cards()
+        # 凭证就绪后，给名称为空的美股代码后台补名称（首次会全量拉 assets，约1-2秒）
+        self._backfill_us_names()
         self.worker = QuoteWorker(self.config)
         self.worker.quote_updated.connect(self.on_quote)
         self.worker.alert_triggered.connect(self.on_alert)
@@ -1849,6 +2147,7 @@ class FloatingWindow(QWidget):
             self.worker.stop()
             self.worker.wait(2000)
             self.worker = None
+        alpaca_stream.stop()   # 停实时流线程（daemon，随进程退出也会自己结束）
         if hasattr(self, '_uptime_timer'):
             self._uptime_timer.stop()
         self.status_dot.setStyleSheet(f'color: {COLOR_FLAT}; font-size: 9px;')
@@ -1872,11 +2171,11 @@ class FloatingWindow(QWidget):
         """
         size_key = self.config.get('kline_size', 'small')
         if self._kline_tooltip is None:
-            self._kline_tooltip = KlineTooltip(size_key)
+            self._kline_tooltip = KlineTooltip(size_key, main_window=self)
         elif self._kline_tooltip.size_key != size_key if hasattr(self._kline_tooltip, 'size_key') else True:
             # 尺寸变更时重建
             self._kline_tooltip.close()
-            self._kline_tooltip = KlineTooltip(size_key)
+            self._kline_tooltip = KlineTooltip(size_key, main_window=self)
 
         already_visible = self._kline_tooltip.isVisible()
         self._kline_tooltip.set_data(code, name, klines)
@@ -1899,6 +2198,29 @@ class FloatingWindow(QWidget):
             # 确保不超出屏幕
             x = max(screen.left(), min(x, screen.right() - tip_w))
             y = max(screen.top(), min(y, screen.bottom() - tip_h))
+
+            # 避让悬浮窗本体：K线图现在可接收鼠标（双击关闭），若盖住悬浮窗
+            # 会挡住卡片悬停导致图反复消失，因此优先放到悬浮窗外侧
+            main_geo = self.frameGeometry()
+            overlap = not (x + tip_w < main_geo.left() or x > main_geo.right()
+                           or y + tip_h < main_geo.top() or y > main_geo.bottom())
+            if overlap:
+                # 优先: 贴到悬浮窗正上方
+                y_top = main_geo.top() - tip_h - 4
+                if y_top >= screen.top():
+                    y = y_top
+                else:
+                    # 其次: 贴到悬浮窗正左侧
+                    x_left = main_geo.left() - tip_w - 4
+                    if x_left >= screen.left():
+                        x = x_left
+                    else:
+                        # 放不下: 贴悬浮窗顶边，允许少量重叠
+                        y = max(screen.top(), main_geo.top() - tip_h)
+                # 避让后再次确保不出屏幕
+                x = max(screen.left(), min(x, screen.right() - tip_w))
+                y = max(screen.top(), min(y, screen.bottom() - tip_h))
+
             self._kline_tooltip.move(x, y)
 
         self._kline_tooltip.show()
@@ -1960,6 +2282,10 @@ class FloatingWindow(QWidget):
         if self.worker:
             self.worker.stop()
             self.worker.wait(2000)
+        try:
+            alpaca_stream.stop()
+        except Exception:
+            pass
         try:
             close_tdx_client()
         except Exception:

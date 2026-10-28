@@ -431,7 +431,7 @@ def get_quotes_tencent_batch(codes):
     import urllib.request
     import re
 
-    # 项目已收敛为纯 A 股，代码原样透传
+    # A股专用函数，代码原样透传
     # （这里不能过滤：下面 code_map 是按位索引 normalized 的，过滤会错位；
     #   真正的过滤在 get_quotes_batch 入口完成）
     normalized = list(codes)
@@ -581,7 +581,7 @@ def get_quotes_tencent_sqt_batch(codes):
     import urllib.request
     import re
 
-    # 项目已收敛为纯 A 股，代码原样透传
+    # A股专用函数，代码原样透传
     # （这里不能过滤：下面 code_map 是按位索引 normalized 的，过滤会错位；
     #   真正的过滤在 get_quotes_batch 入口完成）
     normalized = list(codes)
@@ -798,7 +798,7 @@ def get_quotes_batch(codes, source='auto', host=None):
                 print(f'[TDX Batch] Error for {code}: {e}')
         return results
 
-    # 仅保留 A 股代码；非 A 股一律忽略（项目已收敛为纯 A 股监控）
+    # 仅保留 A 股代码；非 A 股一律忽略（美股由 alpaca_stream/alpaca_history 单独取数）
     a_share_codes = [c for c in codes if detect_market(c) == 'a_share']
     if not a_share_codes:
         return {}
@@ -860,35 +860,39 @@ def get_quotes_batch(codes, source='auto', host=None):
     return results
 
 
-def get_kline(code, period='1min', count=60):
+def get_kline(code, period='1min', count=60, latest_day_only=False):
     """获取 A 股 K 线数据（多周期，带备用源）
 
     period: '1min' | 'daily' | 'weekly'
     数据源：东方财富 (klt=1/101/102) 优先，失败回退腾讯
+    latest_day_only: 仅保留最后一根K线所属交易日的数据。分时全天化用：
+                     先拉 count=300 根（覆盖全天240根+缓冲），再按最后一根
+                     的日期过滤，得到"当天开盘至当前"的全部数据，避免跨天混杂
     返回: [{'time','open','high','low','close','volume'}, ...]
     """
     if detect_market(code) != 'a_share':
         return []
     try:
-        klines = _get_kline_eastmoney(code, count, period)
+        klines = _get_kline_eastmoney(code, count, period, latest_day_only)
     except Exception as e:
         print(f'[KLine] eastmoney error: {e}')
         klines = []
     if not klines:
         # 东财是单点，它不可用时用腾讯兜底，避免 K 线悬浮图整体消失
-        klines = _get_kline_tencent(code, count, period)
+        klines = _get_kline_tencent(code, count, period, latest_day_only)
     return klines
-def get_kline_1min(code, count=60):
+def get_kline_1min(code, count=60, latest_day_only=False):
     """获取1分钟K线数据（兼容旧接口）"""
-    return get_kline(code, '1min', count)
+    return get_kline(code, '1min', count, latest_day_only)
 
 
-def _get_kline_tencent(code, count=60, period='1min'):
+def _get_kline_tencent(code, count=60, period='1min', latest_day_only=False):
     """腾讯 K 线（东方财富不可用时的备用源）
 
     为什么要有它：此前 K 线只有东方财富一条路，它一挂 K 线悬浮图就整体消失。
     接口返回字段顺序是「时间, 开, 收, 高, 低, 量」——注意是开收高低，
     不是常见的开高低收，映射时别搞错。
+    latest_day_only: 仅保留最后一根K线所属交易日的数据（分时全天化）
     """
     import json as _json
     import urllib.request
@@ -908,6 +912,7 @@ def _get_kline_tencent(code, count=60, period='1min'):
         return []
 
     out = []
+    days = []   # 与 out 一一对应的原始日期（分钟线 yyyymmdd / 日周K yyyy-mm-dd），供按日过滤
     skipped = 0
     for r in rows:
         try:
@@ -916,8 +921,10 @@ def _get_kline_tencent(code, count=60, period='1min'):
             # 认不出的格式直接跳过 —— 宁可少一根蜡烛，也不要塞脏数据进图
             if len(ts) >= 12 and ts.isdigit():
                 t = f'{ts[8:10]}:{ts[10:12]}'
+                days.append(ts[:8])
             elif len(ts) == 10 and ts[4] == '-':
                 t = ts
+                days.append(ts[:10])
             else:
                 skipped += 1
                 continue
@@ -934,13 +941,18 @@ def _get_kline_tencent(code, count=60, period='1min'):
             continue
     if skipped:
         print(f'[KLine Tencent] 跳过 {skipped} 条格式异常记录')
+    if latest_day_only and out:
+        # 按最后一根的日期过滤：只保留同一交易日的数据（分时全天化）
+        last_day = days[-1]
+        out = [k for k, d in zip(out, days) if d == last_day]
     return out
 
 
-def _get_kline_eastmoney(code, count=60, period='1min'):
+def _get_kline_eastmoney(code, count=60, period='1min', latest_day_only=False):
     """东方财富K线 (A股)
     period: '1min'(klt=1) | 'daily'(klt=101) | 'weekly'(klt=102)
     fqt=1 前复权
+    latest_day_only: 仅保留最后一根K线所属交易日的数据（分时全天化）
     """
     import urllib.request
     import json as _json
@@ -979,6 +991,7 @@ def _get_kline_eastmoney(code, count=60, period='1min'):
         return []
 
     result = []
+    days = []   # 与 result 一一对应的原始日期（'YYYY-MM-DD'），供按日过滤
     for line in klines:
         parts = line.split(',')
         if len(parts) < 6:
@@ -1000,8 +1013,13 @@ def _get_kline_eastmoney(code, count=60, period='1min'):
                 'low': float(parts[4]),
                 'volume': float(parts[5]),
             })
+            days.append(raw_time)
         except (ValueError, IndexError):
             continue
+    if latest_day_only and result:
+        # 按最后一根的日期过滤：只保留同一交易日的数据（分时全天化）
+        last_day = days[-1]
+        result = [k for k, d in zip(result, days) if d == last_day]
     return result
 
 

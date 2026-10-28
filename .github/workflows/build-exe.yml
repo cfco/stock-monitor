@@ -1,6 +1,7 @@
-name: Build Windows EXE
+name: Build Releases
 
-# 推 tag（如 v5.2.0）自动构建并发布 Release；也可在 Actions 页面手动触发
+# 推 tag（如 v5.2.0）自动构建 Windows EXE + Linux 二进制并发布 Release；
+# 也可在 Actions 页面手动触发
 on:
   push:
     tags:
@@ -11,7 +12,8 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  # ---------------- Windows: 单文件 EXE ----------------
+  build-windows:
     runs-on: windows-latest
 
     steps:
@@ -26,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install PySide6-Essentials eltdx pyinstaller
+          pip install PySide6-Essentials eltdx pyinstaller websocket-client tzdata
 
       - name: Build single-file exe
         run: |
@@ -56,4 +58,70 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/StockMonitor.exe
+          generate_release_notes: true
+
+  # ---------------- Linux: 单文件二进制 + tar.gz ----------------
+  # 构建机选 ubuntu-22.04（glibc 2.35）：其产物可在 22.04/24.04 及 WSL 上运行；
+  # 若选 24.04 构建，glibc 2.39 会导致 22.04 目标机无法运行
+  build-linux:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # PySide6 的 xcb 平台插件在运行时需要这些系统库；
+      # xvfb 用于无显示环境下做启动冒烟测试
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-cursor0 libxkbcommon-x11-0 xvfb
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PySide6-Essentials eltdx pyinstaller websocket-client tzdata
+
+      # 与 Windows 的差异：--add-data 分隔符必须用冒号（Linux 路径风格）
+      - name: Build single-file binary
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed --name StockMonitor --paths scripts --hidden-import price_alert --add-data "scripts/watchlist_config.json:scripts" --exclude-module PySide6.QtWebEngineCore --exclude-module PySide6.QtWebEngineWidgets --exclude-module PySide6.QtWebEngineQuick --exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick --exclude-module PySide6.QtQuick3D --exclude-module PySide6.Qt3DCore --exclude-module PySide6.Qt3DRender --exclude-module PySide6.QtMultimedia --exclude-module PySide6.QtCharts --exclude-module PySide6.QtDataVisualization --exclude-module tkinter floating_window.py
+
+      - name: Smoke test (二进制能在无显示环境起来吗)
+        run: |
+          xvfb-run -a bash -c '
+            ./dist/StockMonitor &
+            APP_PID=$!
+            sleep 12
+            if kill -0 $APP_PID 2>/dev/null; then
+              echo "二进制已稳定运行 12 秒，判定启动正常"
+              kill $APP_PID
+            else
+              echo "进程提前退出，构建产物不可用" >&2
+              exit 1
+            fi
+          '
+
+      - name: Pack tar.gz
+        run: |
+          tar -czf StockMonitor-linux-x64.tar.gz -C dist StockMonitor
+          ls -lh StockMonitor-linux-x64.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StockMonitor-linux
+          path: StockMonitor-linux-x64.tar.gz
+          if-no-files-found: error
+
+      - name: Publish Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: StockMonitor-linux-x64.tar.gz
           generate_release_notes: true
