@@ -1,0 +1,29 @@
+{
+  "interval": 5,
+  "source": "auto",
+  "theme": "auto",
+  "kline_size": "small",
+  "tdx_host": "",
+  "alerts": [
+    {
+      "code": "sh000001",
+      "name": "上证指数",
+      "target": null,
+      "dir": "below",
+      "target_pct": null,
+      "pct_dir": "both",
+      "position": "",
+      "note": "指数监控"
+    },
+    {
+      "code": "sh601398",
+      "name": "工商银行",
+      "target": null,
+      "dir": "below",
+      "target_pct": null,
+      "pct_dir": "both",
+      "position": "",
+      "note": ""
+    }
+  ]
+}

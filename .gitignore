@@ -7,6 +7,7 @@ __pycache__/
 build/
 dist/
 *.spec
+!StockMonitor.spec
 
 # IDE
 .idea/
@@ -17,3 +18,10 @@ dist/
 # 运行产物
 reports/
 *.log
+.screenshots/
+
+# 本机实际配置：含自选股与 DPAPI 加密的 Alpaca 凭证，不进版本库
+# （模板见 scripts/watchlist_config.example.json）
+scripts/watchlist_config.json
+scripts/watchlist_config.json.tmp
+scripts/watchlist_config.json.broken-*
