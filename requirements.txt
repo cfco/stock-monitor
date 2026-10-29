@@ -1,5 +1,4 @@
 PySide6-Essentials>=6.5.0
 eltdx>=0.1.0
-websocket-client>=1.8.0
-tzdata
-
+websocket-client>=1.9.2
+tzdata>=2026.5

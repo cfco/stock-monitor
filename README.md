@@ -1,4 +1,4 @@
-# Stock Monitor 桌面悬浮窗 v5.2
+# Stock Monitor 桌面悬浮窗 v5.2.1
 
 Windows 11 桌面 **A 股 + 美股** 监控悬浮窗：无边框、置顶、半透明、可拖拽。目标价 + 单日涨跌幅双预警，鼠标悬停显示 K 线图。
 
@@ -12,6 +12,7 @@ Windows 11 桌面 **A 股 + 美股** 监控悬浮窗：无边框、置顶、半�
 - **美股行情（Alpaca 免费版）**：
   - 与 A 股卡片**混排显示**，卡片带 `US` 市场标签，价格用 `$`，涨跌幅同为红涨绿跌
   - 实时数据走 **WebSocket**（IEX feed，含盘前盘后），仅在美东 04:00-20:00（夜盘）保持连接
+  - 现价口径：**最近成交价优先**；盘前盘后买卖价差过宽（>1%）时不取中值，回退最近收盘价，避免挂单噪声显示成假涨跌
   - 历史 K 线与休市兜底走 **REST**（休市显示最近收盘价，本地 60s TTL 节流省配额）
   - K 线周期与 A 股一致可切换：分时 / 日K / 周K（时间统一显示北京时间）
   - 凭证 DPAPI 加密存本地（`secret_store.py`，勾选「启用美股」时弹窗录入），未配置时功能自动停用
@@ -110,7 +111,7 @@ Windows 下也可以双击 `run.vbs`（无 cmd 黑框）或 `run.bat`。
 
 ## 配置文件
 
-配置保存在 `scripts/watchlist_config.json`：
+配置保存在 `scripts/watchlist_config.json`（**只留在本机，不进版本库**：里面有你的自选股和加密后的凭证）。仓库里提供模板 `scripts/watchlist_config.example.json`，打包时随包释放的就是它：
 
 ```json
 {
@@ -219,11 +220,11 @@ Windows 下也可以双击 `run.vbs`（无 cmd 黑框）或 `run.bat`。
 推一个 tag 即自动构建 Windows exe + Linux 二进制并创建 Release：
 
 ```bash
-git tag v5.2.0
-git push github v5.2.0
+git tag v5.2.1
+git push github v5.2.1
 ```
 
-工作流见 `.github/workflows/build-exe.yml`（两个 job：`build-windows` / `build-linux`），也可以在 Actions 页面手动触发（`workflow_dispatch`）。
+工作流见 `.github/workflows/build-exe.yml`（`test` → `build-windows` / `build-linux`：单测不过不出包），也可以在 Actions 页面手动触发（`workflow_dispatch`）。打包定义只有一份 `StockMonitor.spec`，本地与 CI 都执行 `pyinstaller --noconfirm --clean StockMonitor.spec`；CI 打包前会用模板配置覆盖本机配置，产物里不会带上你的自选股。
 
 构建产物：
 - `StockMonitor.exe` — Windows 单文件（无需安装 Python）
@@ -239,7 +240,8 @@ stock-monitor/
 │   ├── alpaca_history.py         # 美股历史数据（REST：K 线 / 快照 / 昨收 / 名称）
 │   ├── alpaca_stream.py          # 美股实时行情（WebSocket + 统一取数入口）
 │   ├── secret_store.py           # 本地凭证 DPAPI 加密存储（Alpaca Key/Secret）
-│   └── watchlist_config.json     # 自选股配置（alpaca 段为加密凭证）
+│   ├── watchlist_config.json     # 本机自选股配置（含加密凭证，不入库）
+│   └── watchlist_config.example.json  # 配置模板（随包释放的默认值）
 ├── .github/workflows/
 │   └── build-exe.yml             # 自动打包 exe
 ├── run.bat / run.vbs             # Windows 启动脚本
@@ -255,7 +257,7 @@ stock-monitor/
 - **美股**：Alpaca 免费版（实时 WebSocket + 历史 REST，IEX feed）
 - **通达信**：eltdx（可选备用源）
 - **Python**：>= 3.10
-- **依赖**：`PySide6-Essentials >= 6.5.0`、`eltdx >= 0.1.0`（可选）、`websocket-client >= 1.8.0`、`tzdata`（Windows 下 zoneinfo 时区库）
+- **依赖**：`PySide6-Essentials >= 6.5.0`、`eltdx >= 0.1.0`（可选）、`websocket-client >= 1.9.2`（1.9.x 起必须显式给 `proxy_type`）、`tzdata >= 2026.5`（Windows 下 zoneinfo 时区库）
 
 ## License
 

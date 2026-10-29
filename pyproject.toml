@@ -1,7 +1,7 @@
 [project]
 name = "stock-monitor"
-version = "0.1.0"
-description = "Stock Monitor 桌面悬浮窗版 v5.0"
+version = "5.2.1"
+description = "Stock Monitor 桌面悬浮窗版 v5.2.1"
 requires-python = ">=3.10"
 dependencies = [
     "PySide6-Essentials>=6.5.0",
