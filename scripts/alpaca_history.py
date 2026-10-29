@@ -39,6 +39,10 @@ FEED = 'iex'                    # 免费版唯一可用的实时口径
 MAX_REQ_PER_MIN = 180           # 官方 200/分钟，留 20 次余量避免 429
 SNAPSHOT_TTL = 60               # 快照缓存有效期（秒）：休市时价格不变，不必每轮请求
 SYMBOLS_PER_BATCH = 250         # Alpaca 批量 symbols 单次上限
+# 盘前盘后用买卖中值当现价的前提：价差够窄。实测（ET 05:28 盘前）AAPL
+# bp=325.91 / ap=360.46（价差 10%）且无成交，中值 343.19 比昨收低 1.1%，
+# 直接取中值会显示假涨跌、并可能误触目标价预警 —— 价差超这个比例就不认这条报价
+MAX_SPREAD_RATIO = 0.01
 
 TZ_ET = ZoneInfo('America/New_York')   # 美东（判断交易时段/是否"今天"）
 TZ_SH = ZoneInfo('Asia/Shanghai')      # 北京（K 线时间展示口径）
@@ -202,6 +206,33 @@ def _parse_iso(ts):
         return None
 
 
+def _same_day_bars(rows_desc):
+    """按「最新一根所在的 ET 交易日」过滤降序 bar 列表（时间戳坏的直接跳过）"""
+    kept = []
+    day = None
+    for bar in rows_desc:
+        t = _parse_iso(bar.get('t')) if isinstance(bar, dict) else None
+        if t is None:
+            continue
+        et_day = t.astimezone(TZ_ET).date()
+        if day is None:
+            day = et_day
+        if et_day != day:
+            break                       # 降序排列，往后都是更早的交易日
+        kept.append(bar)
+    return kept
+
+
+def _close_of(bar):
+    """取日K收盘价；坏数据返回 None。
+    原先是 bars_desc[1]['c'] 裸下标，一根缺字段的 bar 会让整批美股快照抛出去，
+    结果是「一只票的坏数据 → 所有美股这一轮全部没有行情」。"""
+    try:
+        return float(bar.get('c') or 0) or None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def _resolve_prev_close(bars_desc, now_et=None):
     """从按时间降序排列的日K里解析「涨跌幅基准价」
 
@@ -216,16 +247,17 @@ def _resolve_prev_close(bars_desc, now_et=None):
         return None, None
     now_et = now_et or datetime.datetime.now(TZ_ET)
     b0 = bars_desc[0]
-    t0 = _parse_iso(b0.get('t'))
+    t0 = _parse_iso(b0.get('t')) if isinstance(b0, dict) else None
     b0_is_today = bool(t0 and t0.astimezone(TZ_ET).date() == now_et.date())
-    latest_close = float(b0.get('c') or 0) or None
+    latest_close = _close_of(b0)
+    prev_bar_close = _close_of(bars_desc[1]) if len(bars_desc) > 1 else None
 
     if b0_is_today:
-        prev = float(bars_desc[1]['c']) if len(bars_desc) > 1 else None
+        prev = prev_bar_close
     elif in_us_data_window(now_et):
         prev = latest_close                      # 盘前：报价对昨收
     else:
-        prev = float(bars_desc[1]['c']) if len(bars_desc) > 1 else latest_close
+        prev = prev_bar_close or latest_close
     return prev, latest_close
 
 
@@ -271,20 +303,43 @@ def _fetch_latest_quotes(codes):
     return out
 
 
-def _quote_price(q):
-    """从最新报价里取价：买卖中值；单边缺失时用另一边"""
+def pick_quote_price(bp, ap, last_trade=None, ref=None):
+    """报价 → 可信现价（REST 与 WebSocket 共用的唯一口径）
+
+    优先级：最近成交价 > 买卖中值（仅当价差够窄）> 单边价。
+    价差过宽时返回 None，由调用方回退到最近收盘价 —— 盘前"有价无市"的中值
+    只是挂单噪声，拿它算涨跌会显示假百分比甚至误触预警（见 MAX_SPREAD_RATIO）。
+    ref 只用于判定价差宽窄，不参与取值。
+    """
     try:
-        bp = float(q.get('bp') or 0)
-        ap = float(q.get('ap') or 0)
-        if bp > 0 and ap > 0:
-            return round((bp + ap) / 2, 4)
-        if bp > 0:
-            return round(bp, 4)
-        if ap > 0:
-            return round(ap, 4)
+        bp = float(bp or 0)
+        ap = float(ap or 0)
     except (TypeError, ValueError):
-        pass
+        return None
+    try:
+        lt = float(last_trade or 0)
+    except (TypeError, ValueError):
+        lt = 0
+    if lt > 0:
+        return round(lt, 4)
+    if bp > 0 and ap > 0:
+        mid = (bp + ap) / 2
+        reference = float(ref or 0) if ref else 0
+        if reference > 0 and abs(ap - bp) / reference > MAX_SPREAD_RATIO:
+            return None                      # 宽价差：中值不可信
+        return round(mid, 4)
+    if bp > 0:
+        return round(bp, 4)
+    if ap > 0:
+        return round(ap, 4)
     return None
+
+
+def _quote_price(q, ref=None):
+    """从最新报价里取价（口径见 pick_quote_price）"""
+    if not isinstance(q, dict):
+        return None
+    return pick_quote_price(q.get('bp'), q.get('ap'), q.get('p'), ref)
 
 
 # ============================================================
@@ -325,7 +380,7 @@ def latest_snapshot_batch(codes, force=False):
         if prev is not None:
             _set_prev_close(sym, prev)
 
-        price = _quote_price(quotes.get(sym) or {})
+        price = _quote_price(quotes.get(sym) or {}, ref=latest_close)
         # 休市（数据窗口外）优先用最近收盘价（选项6-A）：
         # 盘后报价的买卖价差可能极宽（实测 AAPL 周五盘后 bp=328.76/ap=363.43，
         # 中值 346 严重偏离收盘 343.39），窗口外用中值会显示"错价"
@@ -457,6 +512,13 @@ def get_kline(code, period='1min', count=60):
     rows = (data or {}).get('bars') or []
     if not rows:
         return []                               # 404（无数据）也走这里，静默降级
+
+    if period == '1min':
+        # 只保留最新一根所在的交易日：盘前今日不足 count 根时，desc 取数会把上一
+        # 交易日的 bar 补进来，而标签只有 HH:MM → 图上出现两根同一时刻分属两天
+        rows = _same_day_bars(rows)
+        if not rows:
+            return []
 
     # 日K顺手更新昨收缓存（挂机跨日时保持涨跌幅基准新鲜）
     if period == 'daily':

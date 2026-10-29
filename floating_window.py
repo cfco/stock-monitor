@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-floating_window.py — Stock Monitor 桌面悬浮窗 v5.0
+floating_window.py — Stock Monitor 桌面悬浮窗 v5.2.1
 PySide6 原生 Win11 风格悬浮窗：无边框、置顶、半透明、可拖拽
 数据获取复用 price_alert.py（A股）+ alpaca_*.py（美股 Alpaca 免费版）：
   - A股：五路免费接口轮询（腾讯/新浪/东方财富/通达信）
@@ -86,7 +86,7 @@ from PySide6.QtWidgets import (
 # ============================================================
 # 配置
 # ============================================================
-VERSION = "5.2"
+VERSION = "5.2.1"
 # 源码运行：项目内 scripts/watchlist_config.json
 # 打包 exe：exe 同级的 watchlist_config.json（用户可直接编辑，重启不丢）
 CONFIG_FILE = (
@@ -247,16 +247,33 @@ def load_config():
         return config
     except Exception as e:
         print(f'Error loading config: {e}')
+        # 损坏配置先改名留证再回退默认值：否则随后任何一次保存（含美股自动补名）
+        # 都会把空 alerts 覆写上去，自选股整份不可恢复
+        try:
+            backup = CONFIG_FILE + '.broken-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+            os.replace(CONFIG_FILE, backup)
+            print(f'[Config] 损坏配置已备份到 {backup}，可手工修复后重启')
+        except OSError as rename_err:
+            print(f'[Config] 备份损坏配置失败: {rename_err}')
         return {'interval': 5, 'source': 'auto', 'alerts': [], 'theme': 'auto'}
 
 
 def save_config(config):
+    """原子写：先写同目录临时文件再替换，避免进程在写入中途被杀留下半截 JSON"""
+    tmp = CONFIG_FILE + '.tmp'
     try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8-sig') as f:
+        with open(tmp, 'w', encoding='utf-8-sig') as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_FILE)
         return True
     except Exception as e:
         print(f'Error saving config: {e}')
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
         return False
 
 
@@ -319,8 +336,36 @@ class QuoteWorker(QThread):
         self.running = False
 
     def run(self):
+        """QThread 入口：任何一轮取数抛出的异常都不能让线程静默死掉。
+
+        原实现里 run() 整段没有兜底，异常会让线程直接终止，而 'stopped' 也发不出去
+        —— 状态点保持绿色、时间标签停走，用户以为一切正常（本项目最难查的那类故障）。
+        """
         self.running = True
         self.status_changed.emit('running')
+        fatal_streak = 0
+        try:
+            while self.running:
+                loop_started = time.time()
+                try:
+                    self._run_loop()
+                    break                       # stop() 置位后的正常退出
+                except Exception as e:
+                    # 能撑过 2 分钟说明是偶发，重新计数；连续快速失败才是真坏了
+                    fatal_streak = 1 if time.time() - loop_started > 120 else fatal_streak + 1
+                    print(f'[Worker] 取数循环异常（第 {fatal_streak} 次）: {e}')
+                    if fatal_streak >= 3:
+                        break
+                    time.sleep(1)
+        finally:
+            self.running = False
+            self.status_changed.emit('stopped' if fatal_streak < 3 else 'error')
+            try:
+                close_tdx_client()
+            except Exception:
+                pass
+
+    def _run_loop(self):
         consecutive_errors = 0
         max_errors = 10
 
@@ -336,23 +381,40 @@ class QuoteWorker(QThread):
 
             # 批量获取行情（按数据源分组，减少请求次数）
             fetch_start = time.time()
-            valid_codes = [item.get('code', '') for item in alerts if item.get('code')]
+            # 「启用美股」关掉后彻底不碰美股（REST 也不发）：原先只是停 WS，
+            # 快照与日K 预取照旧打 Alpaca，既耗配额又和界面开关的语义不符
+            us_enabled = bool((config.get('alpaca') or {}).get('enabled'))
+            valid_codes = [item.get('code', '') for item in alerts
+                           if item.get('code')
+                           and (us_enabled or not is_us_symbol(item.get('code')))]
 
             # 按市场分流：非美股走 A 股五路轮询，美股走 Alpaca（WS 缓存优先，REST 兜底）
+            # 美股按归一化代码请求（大写、剥掉 us 前缀），结果再映射回配置里的原样代码：
+            # 否则手改/旧版配置的 'aapl'、'usAAPL' 永远查不到键，卡片会一直显示 '--'
             a_codes = [c for c in valid_codes if not is_us_symbol(c)]
-            us_codes = [c for c in valid_codes if is_us_symbol(c)]
+            us_key = {}
+            for c in valid_codes:
+                us_sym = normalize_us_symbol(c)
+                if us_sym:
+                    us_key.setdefault(us_sym, c)
+            us_codes = list(us_key.values())
 
             results = {}
             # A股交易时间外不刷新行情（首次启动除外，避免空白）
             if a_codes and (is_first_loop or is_a_share_trading_time()):
                 results.update(get_quotes_batch(a_codes, source))
-            if us_codes:
+            if us_key:
                 # 美股每轮都取：交易时段读 WS 内存缓存（零网络开销），
                 # 休市时段走 REST，REST 内部有 60s TTL 节流，不会浪费免费版配额
                 try:
-                    results.update(alpaca_stream.get_quotes_batch(us_codes))
+                    got = alpaca_stream.get_quotes_batch(list(us_key))
+                    results.update({us_key[k]: v for k, v in got.items() if k in us_key})
                 except Exception as e:
                     print(f'[Alpaca] 美股取数异常: {e}')
+            # 休市（A股收盘且列表里没有美股）不是故障：不能计入连续错误，
+            # 否则纯 A 股列表每晚都会误报红点，还反复重建 TDX 连接
+            if not us_codes and not (a_codes and (is_first_loop or is_a_share_trading_time())):
+                loop_success = True
             self._first_loop = False
 
             # 串行处理结果
@@ -484,8 +546,7 @@ class QuoteWorker(QThread):
             if not self._kline_period_fetching:
                 period_pairs = []
                 now_ts = time.time()
-                all_codes = [item.get('code', '') for item in alerts if item.get('code')]
-                for c in all_codes:
+                for c in valid_codes:          # 已按「启用美股」过滤，关掉的不再预取
                     for period in ('daily', 'weekly'):
                         cache_key = f'{c}_{period}'
                         last_ts = (self._kline_get(cache_key) or (0, []))[0]
@@ -503,12 +564,6 @@ class QuoteWorker(QThread):
             while slept < sleep_time and self.running:
                 time.sleep(0.1)
                 slept += 0.1
-
-        self.status_changed.emit('stopped')
-        try:
-            close_tdx_client()
-        except Exception:
-            pass
 
     def _fetch_a_share_klines(self, codes):
         """后台线程: 获取A股1分钟K线并缓存"""
@@ -535,7 +590,9 @@ class QuoteWorker(QThread):
                 if not self.running:
                     break
                 try:
-                    klines = alpaca_history.get_kline(code, '1min', 60)
+                    # 缓存键用配置里的原样代码（卡片按它取），请求用归一化后的代码
+                    klines = alpaca_history.get_kline(normalize_us_symbol(code) or code,
+                                                      '1min', 60)
                     if klines:
                         self._kline_put(code, klines)
                 except Exception as e:
@@ -732,8 +789,8 @@ class KlineTooltip(QWidget):
         title = f'{self.name}  {self.code}  {self._price_fmt(last["close"])}'
         p.drawText(10, 16, title)
 
-        # 涨跌幅
-        if first['close'] > 0:
+        # 涨跌幅（除的是首根开盘价，守卫也必须看它：Alpaca 缺字段时 open 会是 0）
+        if first['open'] > 0:
             pct = ((last['close'] - first['open']) / first['open']) * 100
         else:
             pct = 0
@@ -1452,7 +1509,7 @@ class SettingsDialog(QDialog):
                 f'}}'
                 f'QPushButton:hover {{ background: {COLOR_ALERT}; color: white; }}'
             )
-            del_btn.clicked.connect(lambda _=False, r=row: self._delete_row(r))
+            del_btn.clicked.connect(lambda _=False, b=del_btn: self._delete_row(b))
             self.table.setCellWidget(row, 8, del_btn)
         self._loading = False
 
@@ -1509,12 +1566,20 @@ class SettingsDialog(QDialog):
             f'}}'
             f'QPushButton:hover {{ background: {COLOR_ALERT}; color: white; }}'
         )
-        del_btn.clicked.connect(lambda _=False, r=row: self._delete_row(r))
+        del_btn.clicked.connect(lambda _=False, b=del_btn: self._delete_row(b))
         self.table.setCellWidget(row, 8, del_btn)
         self.table.setCurrentCell(row, 0)
 
-    def _delete_row(self, row):
-        self.table.removeRow(row)
+    def _delete_row(self, btn):
+        """按按钮「当前」所在行删除。
+
+        不能用创建时捕获的行号：removeRow 会把下方行整体上移，
+        旧行号继续用就会删错行（保存即真丢自选股）。
+        """
+        for row in range(self.table.rowCount()):
+            if self.table.cellWidget(row, 8) is btn:
+                self.table.removeRow(row)
+                return
 
     def _on_code_changed(self, row, col):
         """代码单元格变化时,启动异步线程搜索名称(避免阻塞UI)"""
@@ -1536,31 +1601,27 @@ class SettingsDialog(QDialog):
 
         name_item = self.table.item(row, 1)
 
-        # 如果上一个线程还在跑，等它结束
-        if self._resolve_thread and self._resolve_thread.isRunning():
-            # 断开旧线程信号，避免其慢回调在换新线程后写错行
-            try:
-                self._resolve_thread.finished_resolve.disconnect(self._on_resolve_done)
-            except (TypeError, RuntimeError):
-                pass
-            self._resolve_thread.quit()
-            self._resolve_thread.wait(2000)
+        # 回调必须绑定「发出信号的那个线程」：原先是从 self._resolve_thread 反查 item，
+        # 旧线程已结束但排队中的回调会把候选写进新线程的行 —— 名称/代码错挂到别的股票。
+        # 绑定后既不用 wait 阻塞界面，也不用担心误删引用（运行中的 QThread 被 GC 会 abort）。
+        th = _StockResolveThread(code)
+        th._row = row
+        th._item = item
+        th._name_item = name_item
+        th.finished_resolve.connect(lambda cands, t=th: self._on_resolve_done(cands, t))
+        self._resolve_thread = th
+        # 保住仍在跑的线程引用（PySide6 不会替运行中的 QThread 兜住 Python 引用）
+        self._resolve_threads = [t for t in getattr(self, '_resolve_threads', []) if t.isRunning()]
+        self._resolve_threads.append(th)
+        th.start()
 
-        # 启动异步查询
-        self._resolve_thread = _StockResolveThread(code)
-        self._resolve_thread._row = row
-        self._resolve_thread._item = item
-        self._resolve_thread._name_item = name_item
-        self._resolve_thread.finished_resolve.connect(self._on_resolve_done)
-        self._resolve_thread.start()
-
-    def _on_resolve_done(self, candidates):
-        """异步查询完成回调(在主线程执行)"""
+    def _on_resolve_done(self, candidates, thread):
+        """异步查询完成回调(在主线程执行)；只写发起这次查询的那一行"""
         if not candidates:
             return
 
-        item = getattr(self._resolve_thread, '_item', None)
-        name_item = getattr(self._resolve_thread, '_name_item', None)
+        item = getattr(thread, '_item', None)
+        name_item = getattr(thread, '_name_item', None)
         if item is None:
             return
 
@@ -1864,8 +1925,18 @@ class FloatingWindow(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent):
         if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            # 钳制在屏幕内：拖出边界后既看不见也点不到（双击关闭也够不着），
+            # 而托盘「显示」只是 show()，窗口等于找不回
+            self.move(self._clamp_into_screen(event.globalPosition().toPoint() - self._drag_offset))
             event.accept()
+
+    def _clamp_into_screen(self, pos: QPoint) -> QPoint:
+        """把窗口左上角限制在「光标所在屏幕」的可见区域内"""
+        screen = QApplication.screenAt(pos) or QApplication.primaryScreen()
+        geo = screen.availableGeometry()
+        w, h = self.width() or 140, self.height() or 400
+        return QPoint(max(geo.left(), min(pos.x(), geo.right() - w)),
+                      max(geo.top(), min(pos.y(), geo.bottom() - h)))
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         self._drag_offset = None
@@ -1914,6 +1985,8 @@ class FloatingWindow(QWidget):
         """点击托盘图标显示窗口"""
         if reason == QSystemTrayIcon.Trigger:
             self.show()
+            # 窗口曾被拖到屏幕外的话，只 show() 依然看不见：拉回可见区域
+            self.move(self._clamp_into_screen(self.pos()))
             self.raise_()
             self.activateWindow()
 
@@ -2027,6 +2100,9 @@ class FloatingWindow(QWidget):
         dlg.config_changed.connect(self._on_config_changed)
         self._settings_dialog = dlg
         dlg.exec()
+        # 对话框以 self 为 parent，exec 返回后仍作为子对象存活（含整张表）：
+        # 每打开一次就泄漏一份，长期挂机 + 频繁改设置会持续吃内存
+        dlg.deleteLater()
 
     def _on_config_changed(self, new_config):
         self.config = new_config
@@ -2040,12 +2116,17 @@ class FloatingWindow(QWidget):
             else:
                 set_theme(new_theme)
             self._apply_theme()
-        was_running = self.worker and self.worker.isRunning()
+        old = self.worker
+        was_running = old is not None and old.isRunning()
         if was_running:
-            self.worker.stop()
-            self.worker.wait(2000)
+            old.stop()
+            if not old.wait(2000):
+                # 旧线程还卡在一次取数里。此时直接 start_monitor() 会被它的
+                # isRunning() 守卫挡掉，新线程永远建不起来 —— 行情从此永久停更。
+                print('[Monitor] 旧取数线程 2 秒内未退出，等它真正结束后自动重启')
+                old.finished.connect(self._restart_monitor)
         self._rebuild_cards()
-        if was_running:
+        if was_running and old.isFinished():
             self.start_monitor()
 
     def _apply_alpaca_config(self):
@@ -2113,6 +2194,12 @@ class FloatingWindow(QWidget):
             card.name = name
             card._update_name_elided()
 
+    def _restart_monitor(self):
+        """旧取数线程真正退出后补一次重启（见 _on_config_changed 的超时分支）"""
+        if self.worker is not None and self.worker.isRunning():
+            return
+        self.start_monitor()
+
     def start_monitor(self):
         if self.worker and self.worker.isRunning():
             return
@@ -2137,16 +2224,22 @@ class FloatingWindow(QWidget):
         self.worker.batch_done.connect(self.on_batch_done)
         self.worker.start()
         self.start_time = datetime.datetime.now()
-        self._uptime_timer = QTimer(self)
-        self._uptime_timer.timeout.connect(self._update_uptime)
+        # 复用同一个定时器：原先每次重启都 new 一个 QTimer(self)，旧的一直在 1 秒一跳，
+        # 每保存一次设置就泄漏一个活动定时器（长跑进程内存持续增长）
+        if not hasattr(self, '_uptime_timer'):
+            self._uptime_timer = QTimer(self)
+            self._uptime_timer.timeout.connect(self._update_uptime)
         self._uptime_timer.start(1000)
 
 
     def stop_monitor(self):
         if self.worker:
             self.worker.stop()
-            self.worker.wait(2000)
-            self.worker = None
+            if not self.worker.wait(2000):
+                # 线程还在跑时不能丢引用：QThread 对象被 GC 会在运行中析构，Qt 直接 abort
+                print('[Monitor] 取数线程 2 秒内未退出，保留引用直到其自行结束')
+            else:
+                self.worker = None
         alpaca_stream.stop()   # 停实时流线程（daemon，随进程退出也会自己结束）
         if hasattr(self, '_uptime_timer'):
             self._uptime_timer.stop()
