@@ -2365,6 +2365,16 @@ class FloatingWindow(QWidget):
         for card in getattr(self, 'cards', {}).values():
             card.set_time_visible(show)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # X11 下部分窗口管理器会在 map 的那一刻重新摆放一次，把 __init__ 里
+        # 算好的右下角坐标覆盖掉。首次 show 之后再补一次定位；只补一次，
+        # 否则会跟用户之后的手动拖动打架。
+        if getattr(self, '_repositioned_on_show', False):
+            return
+        self._repositioned_on_show = True
+        QTimer.singleShot(0, self._move_to_bottom_right)
+
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         """双击任意位置关闭程序"""
         if event.button() == Qt.LeftButton:
@@ -2889,8 +2899,44 @@ class FloatingWindow(QWidget):
 # ============================================================
 # 入口
 # ============================================================
+def _ensure_positionable_platform():
+    """Wayland 下强制走 xcb（XWayland），否则本程序的窗口定位全部失效。
+
+    xdg-shell 在协议层就禁止客户端自己决定窗口位置，Qt 的 move() 会被静默丢弃，
+    WindowStaysOnTopHint 也只是建议。而"贴屏幕右下角"和"K 线图按鼠标位置弹出并
+    避开主窗口"这两件事都依赖绝对定位，没有可替代的写法。
+
+    只在同时满足三个条件时才改：当前是 Wayland 会话、用户没显式指定过
+    QT_QPA_PLATFORM、且 xcb 插件真的存在 —— 最后一条是防止在精简安装上
+    把"位置不对"变成"根本起不来"。
+    """
+    if os.environ.get('QT_QPA_PLATFORM'):
+        return
+    on_wayland = (os.environ.get('XDG_SESSION_TYPE', '').lower() == 'wayland'
+                  or bool(os.environ.get('WAYLAND_DISPLAY')))
+    if not on_wayland:
+        return
+    try:
+        from PySide6.QtCore import QLibraryInfo
+        plugins = QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)
+        have_xcb = any(
+            os.path.exists(os.path.join(plugins, 'platforms', name))
+            for name in ('libqxcb.so', 'libqxcb.dll')
+        )
+    except Exception:
+        have_xcb = False
+    if not have_xcb:
+        print('[Platform] 检测到 Wayland，但本机没有 xcb 插件：保持默认后端。'
+              '窗口位置与 K 线图定位会被合成器忽略')
+        return
+    os.environ['QT_QPA_PLATFORM'] = 'xcb'
+    print('[Platform] 检测到 Wayland：客户端定位被协议禁止，改用 xcb(XWayland) 启动。'
+          '想回到原生 Wayland 请显式设 QT_QPA_PLATFORM=wayland')
+
+
 def main():
     setup_logging()
+    _ensure_positionable_platform()
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )

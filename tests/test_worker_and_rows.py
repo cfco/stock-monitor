@@ -570,3 +570,78 @@ def _stop_after(worker, rounds, limit):
     rounds.append(1)
     if len(rounds) >= limit:
         worker.running = False
+
+
+class _FakeLibraryInfo:
+    """把 QLibraryInfo 指到临时目录，造出"有/没有 xcb 插件"两种环境"""
+
+    def __init__(self, root):
+        self._root = str(root)
+
+    def path(self, _lib):
+        return self._root
+
+    class LibraryPath:
+        PluginsPath = None
+
+
+def _fake_wayland_env(monkeypatch, **overrides):
+    monkeypatch.delenv('QT_QPA_PLATFORM', raising=False)
+    monkeypatch.delenv('WAYLAND_DISPLAY', raising=False)
+    monkeypatch.setenv('XDG_SESSION_TYPE', 'wayland')
+    for key, value in overrides.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+
+
+def test_wayland_falls_back_to_xcb_when_plugin_exists(monkeypatch, tmp_path):
+    """Wayland + 有 xcb 插件 → 切到 xcb。
+
+    xdg-shell 禁止客户端定位窗口，而"贴右下角"和"K 线图按鼠标弹出并避开主窗口"
+    都只能靠绝对坐标，不切后端这两件事在 Wayland 下无解。
+    """
+    (tmp_path / 'platforms' / 'libqxcb.so').parent.mkdir(parents=True)
+    (tmp_path / 'platforms' / 'libqxcb.so').write_bytes(b'')
+    _fake_wayland_env(monkeypatch)
+    monkeypatch.setattr('PySide6.QtCore.QLibraryInfo', _FakeLibraryInfo(tmp_path))
+
+    fw._ensure_positionable_platform()
+
+    assert os.environ['QT_QPA_PLATFORM'] == 'xcb'
+
+
+def test_wayland_without_xcb_plugin_is_not_forced(monkeypatch, tmp_path):
+    """精简安装没有 xcb 时不能强切，否则"位置不对"会变成"根本起不来"。"""
+    (tmp_path / 'platforms').mkdir(parents=True)
+    _fake_wayland_env(monkeypatch)
+    monkeypatch.setattr('PySide6.QtCore.QLibraryInfo', _FakeLibraryInfo(tmp_path))
+
+    fw._ensure_positionable_platform()
+
+    assert 'QT_QPA_PLATFORM' not in os.environ
+
+
+def test_explicit_platform_is_never_overwritten(monkeypatch, tmp_path):
+    """用户自己设过 QT_QPA_PLATFORM 就尊重到底，哪怕正跑在 Wayland 上。"""
+    (tmp_path / 'platforms' / 'libqxcb.so').parent.mkdir(parents=True)
+    (tmp_path / 'platforms' / 'libqxcb.so').write_bytes(b'')
+    _fake_wayland_env(monkeypatch, QT_QPA_PLATFORM='wayland')
+    monkeypatch.setattr('PySide6.QtCore.QLibraryInfo', _FakeLibraryInfo(tmp_path))
+
+    fw._ensure_positionable_platform()
+
+    assert os.environ['QT_QPA_PLATFORM'] == 'wayland'
+
+
+def test_x11_session_left_untouched(monkeypatch, tmp_path):
+    """X11 会话本来就能自由定位，不该被改后端。"""
+    (tmp_path / 'platforms' / 'libqxcb.so').parent.mkdir(parents=True)
+    (tmp_path / 'platforms' / 'libqxcb.so').write_bytes(b'')
+    _fake_wayland_env(monkeypatch, XDG_SESSION_TYPE='x11')
+    monkeypatch.setattr('PySide6.QtCore.QLibraryInfo', _FakeLibraryInfo(tmp_path))
+
+    fw._ensure_positionable_platform()
+
+    assert 'QT_QPA_PLATFORM' not in os.environ

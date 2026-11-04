@@ -66,8 +66,10 @@ chmod +x StockMonitor
 ```
 
 > Linux 说明：系统托盘需要桌面环境支持（GNOME 需装 AppIndicator 扩展），无托盘时关闭程序用「双击悬浮窗」；DPAPI 凭证加密仅 Windows 有效，Linux 下降级为 base64 编码保存（程序会打印提示）。
+>
+> **Wayland 会话**：悬浮窗贴右下角、K 线图按鼠标位置弹出并避开主窗口，都依赖客户端自己指定窗口坐标；而 xdg-shell 在协议层禁止这件事，`move()` 会被合成器静默丢弃（表现为窗口位置随机、K 线图盖住主窗口）。程序启动时若检测到 Wayland 且本机带 xcb 插件，会自动改走 **xcb（XWayland）**；日志里会打印 `[Platform]` 一行说明。想强制原生 Wayland 就显式设 `QT_QPA_PLATFORM=wayland`（接受定位失效），想强制 X11 就设 `QT_QPA_PLATFORM=xcb`。
 
-所有包由 GitHub Actions 自动构建（推 tag 触发），详见「自动打包」一节。
+所有包由 GitHub Actions 自动构建：**推 `master` 即构建并发一条预发布 Release**（`v{x.y.z}-dev.{N}`），推 tag 发正式版，也可手动触发；私有仓库只在建 tag 或手动触发时发 Release，详见「自动打包」一节。
 
 ### 方式二：源码运行
 
@@ -237,14 +239,24 @@ Windows 下也可以双击 `run.vbs`（无 cmd 黑框）或 `run.bat`。`run.bat
 
 ## 自动打包（GitHub Actions）
 
-推一个 tag 即自动构建 Windows exe + Linux 二进制并创建 Release：
+发布规则按**仓库可见性**分流（GitHub 没有账号级的"公开仓自动发 Release"开关，规则写在 workflow 里，运行时用 API 查可见性）：
+
+| 触发 | 公开仓库 | 私有仓库 |
+|---|---|---|
+| 推 `master` | 构建 + 发一条**预发布** Release（`v{x.y.z}-dev.{N}`）| 只构建，产物留在 Actions 运行页 |
+| 推 `v*` tag | 构建 + 发**正式** Release | 同左 |
+| 手动 `workflow_dispatch` | 构建 + 发 Release | 同左 |
+
+开发构建标 `prerelease=true` 且 `make_latest=false`，所以 `/releases/latest` 始终指向真正的正式版本。开发版 tag 的版本号取自 `pyproject.toml`，`{N}` 是 workflow 运行号，单调递增不撞车。
+
+发正式版本：
 
 ```bash
 git tag v5.3.0
 git push github v5.3.0
 ```
 
-工作流见 `.github/workflows/build-exe.yml`（`test` → `build-windows` / `build-linux`：单测不过不出包），也可以在 Actions 页面手动触发（`workflow_dispatch`）。打包定义只有一份 `StockMonitor.spec`，本地与 CI 都执行 `pyinstaller --noconfirm --clean StockMonitor.spec`；CI 打包前会用模板配置覆盖本机配置，产物里不会带上你的自选股。
+工作流见 `.github/workflows/build-exe.yml`（`test` + `meta` → `build-windows` / `build-linux`：单测不过不出包；`meta` 一次算清可见性与发布参数，两个构建 job 只读结果，避免判断逻辑在两处漂移）。打包定义只有一份 `StockMonitor.spec`，本地与 CI 都执行 `pyinstaller --noconfirm --clean StockMonitor.spec`；CI 打包前会用模板配置覆盖本机配置，产物里不会带上你的自选股。
 
 构建产物：
 - `StockMonitor.exe` — Windows 单文件（无需安装 Python）
