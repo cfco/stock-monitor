@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-floating_window.py — Stock Monitor 桌面悬浮窗 v5.2.1
+floating_window.py — Stock Monitor 桌面悬浮窗 v5.3.0
 PySide6 原生 Win11 风格悬浮窗：无边框、置顶、半透明、可拖拽
 数据获取复用 price_alert.py（A股）+ alpaca_*.py（美股 Alpaca 免费版）：
-  - A股：五路免费接口轮询（腾讯/新浪/东方财富/通达信）
+  - A股：五路免费接口轮询（腾讯×2 / 新浪 / 东方财富×2）
   - 美股：实时=WebSocket 推送（alpaca_stream），历史K线/休市兜底=REST（alpaca_history）
 紧凑版：1/3 宽度，支持目标价 + 单日涨跌% 双预警
 """
@@ -13,8 +13,12 @@ import sys
 import re
 import json
 import time
+import math
+import logging
+import logging.handlers
 import datetime
 import threading
+import concurrent.futures
 
 def _resource_dir():
     """只读资源目录：源码运行时是项目根，打包成 exe 后是 PyInstaller 解包目录。"""
@@ -35,7 +39,11 @@ def _data_dir():
 
 
 sys.path.insert(0, os.path.join(_resource_dir(), 'scripts'))
-from price_alert import close_tdx_client, get_quotes_batch, get_kline_1min
+from price_alert import (
+    close_tdx_client, get_quotes_batch, get_kline_1min,
+    configure_tdx_nodes, format_price, get_source_health,
+    is_a_share_trading_time, is_bj_code, normalize_a_share_code,
+)
 # 美股（Alpaca 免费版）：实时=WebSocket（alpaca_stream），历史/兜底=REST（alpaca_history）
 import alpaca_history
 import alpaca_stream
@@ -68,7 +76,7 @@ def is_us_symbol(code):
     """判断是否为美股代码（行情分流 / 货币符号 / 市场标签共用的单一判定入口）"""
     return bool(normalize_us_symbol(code))
 
-from PySide6.QtCore import Qt, QThread, Signal, QPoint, QRect, QTimer, QSize
+from PySide6.QtCore import Qt, QThread, Signal, QPoint, QRect, QTimer, QSize, QLockFile, QLocale
 from PySide6.QtGui import (
     QFont, QColor, QPalette, QIcon, QPainter, QBrush, QPen,
     QMouseEvent, QPaintEvent, QAction, QIntValidator, QDoubleValidator, QCursor,
@@ -80,13 +88,14 @@ from PySide6.QtWidgets import (
     QMessageBox, QSizePolicy,
     QDialog, QLineEdit, QComboBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QFormLayout, QGroupBox, QSpinBox, QCheckBox,
+    QStyledItemDelegate,
     QSystemTrayIcon, QMenu,
 )
 
 # ============================================================
 # 配置
 # ============================================================
-VERSION = "5.2.1"
+VERSION = "5.3.0"
 # 源码运行：项目内 scripts/watchlist_config.json
 # 打包 exe：exe 同级的 watchlist_config.json（用户可直接编辑，重启不丢）
 CONFIG_FILE = (
@@ -95,12 +104,85 @@ CONFIG_FILE = (
     else os.path.join(_data_dir(), 'scripts', 'watchlist_config.json')
 )
 
+# 运行日志目录（源码/exe 都放在用户可写的数据目录下，不写 PyInstaller 临时目录）
+LOG_DIR = os.path.join(_data_dir(), 'logs')
+LOG_FILE = os.path.join(LOG_DIR, 'stock-monitor.log')
+
+
+class _LogTee:
+    """把 print 同时写到控制台（如果有）和轮转日志文件。"""
+
+    def __init__(self, stream, logger, level):
+        self._stream = stream
+        self._logger = logger
+        self._level = level
+
+    def write(self, data):
+        if self._stream is not None:
+            try:
+                self._stream.write(data)
+            except Exception:
+                pass
+        text = str(data).rstrip()
+        if text:
+            self._logger.log(self._level, text)
+        return len(data)
+
+    def flush(self):
+        if self._stream is not None:
+            try:
+                self._stream.flush()
+            except Exception:
+                pass
+
+    def __getattr__(self, name):
+        if self._stream is None:
+            raise AttributeError(name)
+        return getattr(self._stream, name)
+
+
+def setup_logging():
+    """配置 2MB×3 的轮转日志，并接管 print/stderr（打包后无控制台也能留证）。
+
+    日志目录不可写（例如 exe 放在 Program Files）时静默退化为不落盘，
+    绝不能因为日志问题让整个程序起不来。
+    """
+    logger = logging.getLogger('stock_monitor')
+    if getattr(logger, '_sm_configured', False):
+        return logger
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3, encoding='utf-8'
+        )
+    except OSError as e:
+        try:
+            print(f'[Logging] 无法创建日志文件，改为仅控制台输出: {e}', file=sys.__stderr__)
+        except Exception:
+            pass
+        logger._sm_configured = True
+        return logger
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)s %(message)s', '%Y-%m-%d %H:%M:%S'
+    ))
+    logger.addHandler(handler)
+    logger._sm_configured = True
+
+    # 保留原控制台输出，同时落盘。注意 logger 自身只挂文件 handler、不传播，
+    # 否则写日志又会进入被接管的 stderr，形成递归。
+    sys.stdout = _LogTee(sys.stdout, logger, logging.INFO)
+    sys.stderr = _LogTee(sys.stderr, logger, logging.ERROR)
+    return logger
+
 # 颜色 - 涨跌色（两套主题共用）
 COLOR_UP = '#e74c3c'
 COLOR_DOWN = '#2ecc71'
 COLOR_FLAT = '#95a5a6'
 COLOR_ALERT = '#ff5555'
 COLOR_TRIGGERED = '#00e676'  # 预警触发荧光绿
+COLOR_CLOSED = '#4a7fb5'     # 休市：既不是故障红也不是正常绿，避免和「卡住不更新」混淆
 
 # 双主题
 THEME_DARK = {
@@ -212,8 +294,148 @@ def check_price_alert(price, target, direction):
 
 
 # ============================================================
-# 配置读写
+# 配置读写 / Schema 校验
 # ============================================================
+VALID_SOURCES = ('auto', 'tencent', 'tdx')
+VALID_THEMES = ('auto', 'dark', 'light')
+VALID_KLINE_SIZES = ('small', 'medium', 'large')
+VALID_DIRECTIONS = ('below', 'above', 'both')
+
+
+def _finite_float(value):
+    """把配置/输入转为有限 float；非法值返回 None（NaN/Infinity 一律拒绝）。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def normalize_alert_item(item):
+    """校验并归一单条监控项；无法修复时返回 (None, 错误说明)。
+
+    代码大小写/``s_`` 前缀统一；北交所明确拒绝；目标价/涨跌幅必须是正数。
+    返回的 dict 只含已知字段，避免脏字段进入取数路径。
+    """
+    if not isinstance(item, dict):
+        return None, '监控项不是对象'
+    raw_code = str(item.get('code') or '').strip()
+    if not raw_code:
+        return None, '缺少代码'
+    us_code = normalize_us_symbol(raw_code)
+    if us_code:
+        code = us_code
+    else:
+        code = normalize_a_share_code(raw_code)
+        if not code:
+            if is_bj_code(raw_code):
+                return None, f'暂不支持北交所代码 {raw_code}（仅支持沪深 sh/sz）'
+            return None, f'无法识别代码 {raw_code}（A股 sh/sz + 6位数字，或美股代码）'
+
+    target = None
+    if item.get('target') is not None:
+        target = _finite_float(item.get('target'))
+        if target is None or target <= 0:
+            return None, f'{code} 的目标价必须是正数'
+
+    target_pct = None
+    if item.get('target_pct') is not None:
+        target_pct = _finite_float(item.get('target_pct'))
+        if target_pct is None or target_pct == 0:
+            return None, f'{code} 的目标涨跌幅必须是非零数字'
+        target_pct = abs(target_pct)
+
+    direction = item.get('dir', 'below')
+    if direction not in VALID_DIRECTIONS:
+        direction = 'below'
+    pct_dir = item.get('pct_dir', 'both')
+    if pct_dir not in VALID_DIRECTIONS:
+        pct_dir = 'both'
+    return {
+        'code': code,
+        'name': str(item.get('name') or '').strip(),
+        'target': target,
+        'dir': direction,
+        'target_pct': target_pct,
+        'pct_dir': pct_dir,
+        'position': str(item.get('position') or ''),
+        'note': str(item.get('note') or ''),
+    }, ''
+
+
+def normalize_config(raw):
+    """按当前版本 schema 归一配置，返回配置副本；不因局部坏字段整份丢弃。
+
+    - 顶层必须是对象
+    - tdx_nodes 必须是合法节点列表，否则忽略（旧实现会在启动时 KeyError）
+    - alerts 逐条校验，坏项跳过并打印，其他自选股继续加载
+    """
+    if not isinstance(raw, dict):
+        raise ValueError('配置顶层必须是 JSON 对象')
+
+    config = dict(raw)                 # 保留未知字段（如前向兼容的扩展配置）
+    interval = _finite_float(config.get('interval'))
+    config['interval'] = int(interval) if interval is not None else 5
+    config['interval'] = max(1, min(120, config['interval']))
+
+    if config.get('source') not in VALID_SOURCES:
+        config['source'] = 'auto'
+    if config.get('theme') not in VALID_THEMES:
+        config['theme'] = 'auto'
+    if config.get('kline_size') not in VALID_KLINE_SIZES:
+        config['kline_size'] = 'small'
+    if not isinstance(config.get('tdx_host'), str):
+        config['tdx_host'] = ''
+
+    nodes = config.get('tdx_nodes')
+    valid_nodes = []
+    if isinstance(nodes, list):
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            host = node.get('host')
+            if not isinstance(host, str) or not host.strip():
+                continue
+            priority = _finite_float(node.get('priority'))
+            valid_nodes.append({
+                'id': str(node.get('id') or host),
+                'name': str(node.get('name') or host),
+                'host': host.strip(),
+                'priority': int(priority) if priority is not None else 99,
+            })
+    if valid_nodes:
+        config['tdx_nodes'] = valid_nodes
+    else:
+        # 坏节点配置只丢弃这一段，绝不触发整份配置备份/重置
+        config.pop('tdx_nodes', None)
+
+    raw_alerts = config.get('alerts')
+    if raw_alerts is None:
+        raw_alerts = []
+    if not isinstance(raw_alerts, list):
+        print('[Config] alerts 不是数组，已重置为空列表')
+        raw_alerts = []
+    alerts = []
+    for index, item in enumerate(raw_alerts, 1):
+        normalized, error = normalize_alert_item(item)
+        if normalized is None:
+            print(f'[Config] 跳过第 {index} 条监控项: {error}')
+            continue
+        alerts.append(normalized)
+    config['alerts'] = alerts
+    return config
+
+
+def _apply_tdx_config(config):
+    """把 tdx_host / tdx_nodes 应用到数据层；空值恢复内置默认节点。"""
+    configure_tdx_nodes(
+        str(config.get('tdx_host') or '').strip(),
+        config.get('tdx_nodes'),
+    )
+
+
 def load_config():
     # 打包后首次运行：exe 同级还没有配置文件，先把随包资源释放一份出来，
     # 否则用户打开就是空列表，还得自己一个个加
@@ -231,19 +453,15 @@ def load_config():
 
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8-sig') as f:
-            config = json.load(f)
+            raw_config = json.load(f)
+        config = normalize_config(raw_config)
         # 旧版明文凭证 → DPAPI 密文迁移（幂等；有变更才落盘一次）
         try:
             if secret_store.migrate_config(config):
                 save_config(config)
         except Exception as e:
             print(f'[Config] 凭证迁移失败(不影响启动): {e}')
-        # 处理TDX节点配置
-        custom_nodes = config.get('tdx_nodes')
-        if custom_nodes and isinstance(custom_nodes, list):
-            import price_alert
-            price_alert.TDX_NODES = custom_nodes
-            price_alert.DEFAULT_TDX_HOST = custom_nodes[0]['host']
+        _apply_tdx_config(config)
         return config
     except Exception as e:
         print(f'Error loading config: {e}')
@@ -259,7 +477,15 @@ def load_config():
 
 
 def save_config(config):
-    """原子写：先写同目录临时文件再替换，避免进程在写入中途被杀留下半截 JSON"""
+    """原子写：先写同目录临时文件再替换，避免进程在写入中途被杀留下半截 JSON。
+
+    落盘前统一过 schema，防止调用方（含自动补名等旁路）把非法结构写回去。
+    """
+    try:
+        config = normalize_config(config)
+    except Exception as e:
+        print(f'Error validating config: {e}')
+        return False
     tmp = CONFIG_FILE + '.tmp'
     try:
         with open(tmp, 'w', encoding='utf-8-sig') as f:
@@ -277,22 +503,6 @@ def save_config(config):
         return False
 
 
-def is_a_share_trading_time(now=None):
-    """判断当前是否在A股交易时间段
-    交易时段：09:25-11:30, 13:00-15:00（周末不交易）
-    """
-    now = now or datetime.datetime.now()
-    if now.weekday() >= 5:  # 周六、周日
-        return False
-    minutes = now.hour * 60 + now.minute
-    # 9:25=565, 11:30=690, 13:00=780, 15:00=900
-    if 565 <= minutes <= 690:
-        return True
-    if 780 <= minutes <= 900:
-        return True
-    return False
-
-
 # ============================================================
 # 后台数据拉取线程
 # ============================================================
@@ -300,24 +510,33 @@ class QuoteWorker(QThread):
     quote_updated = Signal(dict)
     alert_triggered = Signal(dict)
     status_changed = Signal(str)
-    batch_done = Signal(str)
+    batch_done = Signal(str)              # 每轮结束（用于测试/心跳）
+    batch_updated = Signal(str, int)      # 仅本轮拿到有效行情时发出（时间戳 + 条数）
+    source_health_changed = Signal(dict)
 
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.running = False
         self._lock = threading.Lock()
-        self.alert_cooldown = {}
+        # 一次性预警：集合里是「已经提醒过且条件仍在持续」的条件键。
+        # 条件解除后移除，下次再满足会重新提醒；不再使用 60 秒冷却。
+        self.alert_latches = set()
         self.kline_cache = {}       # {code: (timestamp, klines)} 1分钟; {code_daily/weekly: ...} 日K/周K
         self._kline_lock = threading.Lock()  # 保护 kline_cache 跨线程读写
         self._kline_fetching = False
         self._us_kline_fetching = False   # 美股 1 分钟 K 线预取标志（与 A 股互不阻塞）
         self._kline_period_fetching = False
         self._first_loop = True     # 首次循环标记（启动时无论是否交易时间都请求一次，避免空白）
+        self._degraded = False
+        self._last_status = None      # 已发出的状态点档位，避免每轮重复 emit
+        self.fatal_error = False
 
     def update_config(self, config):
         with self._lock:
             self.config = config
+            # 条件可能已改写：旧锁存不能继续压制新条件
+            self.alert_latches.clear()
 
     def _kline_get(self, key):
         """线程安全地读 K 线缓存（返回 (timestamp, klines) 或 None）"""
@@ -342,6 +561,7 @@ class QuoteWorker(QThread):
         —— 状态点保持绿色、时间标签停走，用户以为一切正常（本项目最难查的那类故障）。
         """
         self.running = True
+        self._last_status = 'running'
         self.status_changed.emit('running')
         fatal_streak = 0
         try:
@@ -359,7 +579,8 @@ class QuoteWorker(QThread):
                     time.sleep(1)
         finally:
             self.running = False
-            self.status_changed.emit('stopped' if fatal_streak < 3 else 'error')
+            self.fatal_error = fatal_streak >= 3
+            self.status_changed.emit('error' if self.fatal_error else 'stopped')
             try:
                 close_tdx_client()
             except Exception:
@@ -376,8 +597,10 @@ class QuoteWorker(QThread):
             source = config.get('source', 'auto')
             alerts = config.get('alerts', [])
             loop_success = False
+            fresh_count = 0
             now_str = datetime.datetime.now().strftime('%H:%M:%S')
             is_first_loop = self._first_loop
+            a_trading_time = is_a_share_trading_time()
 
             # 批量获取行情（按数据源分组，减少请求次数）
             fetch_start = time.time()
@@ -401,7 +624,7 @@ class QuoteWorker(QThread):
 
             results = {}
             # A股交易时间外不刷新行情（首次启动除外，避免空白）
-            if a_codes and (is_first_loop or is_a_share_trading_time()):
+            if a_codes and (is_first_loop or a_trading_time):
                 results.update(get_quotes_batch(a_codes, source))
             if us_key:
                 # 美股每轮都取：交易时段读 WS 内存缓存（零网络开销），
@@ -413,7 +636,8 @@ class QuoteWorker(QThread):
                     print(f'[Alpaca] 美股取数异常: {e}')
             # 休市（A股收盘且列表里没有美股）不是故障：不能计入连续错误，
             # 否则纯 A 股列表每晚都会误报红点，还反复重建 TDX 连接
-            if not us_codes and not (a_codes and (is_first_loop or is_a_share_trading_time())):
+            market_idle = not us_codes and not (a_codes and (is_first_loop or a_trading_time))
+            if market_idle:
                 loop_success = True
             self._first_loop = False
 
@@ -426,18 +650,23 @@ class QuoteWorker(QThread):
                 direction = item.get('dir', 'below')
                 target_pct = item.get('target_pct')
                 pct_dir = item.get('pct_dir', 'below')
-                name = item.get('name', code)
+                name = item.get('name') or code
                 position = item.get('position', '')
                 note = item.get('note', '')
 
                 q = results.get(code)
                 if q is None:
                     continue
-                price = q.get('price')
-                if price is None:
+                price = _finite_float(q.get('price'))
+                if price is None or price <= 0:
                     continue
 
                 loop_success = True
+                fresh_count += 1
+                is_us = is_us_symbol(code)
+                # A 股非交易时段首次启动只展示收盘价，不拿隔夜旧价触发预警。
+                market_live = is_us or a_trading_time
+                stale = not market_live
 
                 # 部分接口会在行情里附带 K 线，直接预填缓存供悬停即时显示
                 klines = q.get('klines', [])
@@ -448,8 +677,8 @@ class QuoteWorker(QThread):
                     'name': name,
                     'code': code,
                     'price': price,
-                    'change_pct': q.get('change_pct'),
-                    'yest_close': q.get('yest_close'),
+                    'change_pct': _finite_float(q.get('change_pct')),
+                    'yest_close': _finite_float(q.get('yest_close')),
                     'target': target,
                     'direction': direction,
                     'target_pct': target_pct,
@@ -457,57 +686,89 @@ class QuoteWorker(QThread):
                     'position': position,
                     'note': note,
                     'last_update': now_str,
+                    'stale': stale,
                     'klines': klines,
                 }
                 self.quote_updated.emit(payload)
 
+                if not market_live:
+                    continue
+
                 if target is not None:
-                    triggered, reason = self._check_alert(
-                        name, code, price, target, direction
-                    )
-                    if triggered:
-                        cooldown_key = f'{code}_{direction}'
-                        last = self.alert_cooldown.get(cooldown_key, 0)
-                        if time.time() - last >= 60:
-                            self.alert_triggered.emit({
-                                'time': now_str, 'message': reason,
-                                'code': code, 'name': name,
-                                'price': price, 'target': target,
-                                'direction': direction,
-                            })
-                            self.alert_cooldown[cooldown_key] = time.time()
+                    # 先更新两侧锁存，再按实际触发方向提醒；both 时跌破/涨破互不压制。
+                    below_hit = direction in ('below', 'both') and price <= target
+                    above_hit = direction in ('above', 'both') and price >= target
+                    if self._latch_once((code, 'price', 'below'), below_hit) and below_hit:
+                        self.alert_triggered.emit({
+                            'time': now_str,
+                            'message': self._format_price_alert(name, code, price, target, 'below'),
+                            'code': code, 'name': name,
+                            'price': price, 'target': target,
+                            'direction': 'below',
+                        })
+                    if self._latch_once((code, 'price', 'above'), above_hit) and above_hit:
+                        self.alert_triggered.emit({
+                            'time': now_str,
+                            'message': self._format_price_alert(name, code, price, target, 'above'),
+                            'code': code, 'name': name,
+                            'price': price, 'target': target,
+                            'direction': 'above',
+                        })
 
                 if target_pct is not None:
-                    change_pct = q.get('change_pct')
+                    change_pct = _finite_float(q.get('change_pct'))
                     if change_pct is not None:
-                        pct_trig, pct_reason = self._check_pct_alert(
-                            name, code, change_pct, target_pct, pct_dir
-                        )
-                        if pct_trig:
-                            cooldown_key = f'{code}_pct_{pct_dir}'
-                            last = self.alert_cooldown.get(cooldown_key, 0)
-                            if time.time() - last >= 60:
-                                self.alert_triggered.emit({
-                                    'time': now_str, 'message': pct_reason,
-                                    'code': code, 'name': name,
-                                    'price': price, 'target': target_pct,
-                                    'direction': pct_dir,
-                                })
-                                self.alert_cooldown[cooldown_key] = time.time()
+                        hit, hit_dir = self._pct_hit(change_pct, target_pct, pct_dir)
+                        active_below = hit and hit_dir == '跌'
+                        active_above = hit and hit_dir == '涨'
+                        if self._latch_once((code, 'pct', 'below'), active_below) and active_below:
+                            self.alert_triggered.emit({
+                                'time': now_str,
+                                'message': self._format_pct_alert(
+                                    name, code, price, change_pct, target_pct, 'below'),
+                                'code': code, 'name': name,
+                                'price': price, 'target': target_pct,
+                                'direction': 'below',
+                            })
+                        if self._latch_once((code, 'pct', 'above'), active_above) and active_above:
+                            self.alert_triggered.emit({
+                                'time': now_str,
+                                'message': self._format_pct_alert(
+                                    name, code, price, change_pct, target_pct, 'above'),
+                                'code': code, 'name': name,
+                                'price': price, 'target': target_pct,
+                                'direction': 'above',
+                            })
 
             if loop_success:
                 consecutive_errors = 0
+                if self._degraded:
+                    # 恢复后状态点必须回到绿色，不能永远停在红点
+                    self._degraded = False
             else:
                 consecutive_errors += 1
                 if consecutive_errors >= max_errors:
-                    self.status_changed.emit('error')
+                    self._degraded = True
                     try:
                         close_tdx_client()
                     except Exception:
                         pass
                     consecutive_errors = 0
 
+            # 状态点三态：故障红、休市灰、正常绿。休市单列出来是因为它和
+            # 「数据卡住不更新」在界面上长得一模一样，用户分不出来。
+            status = 'error' if self._degraded else ('closed' if market_idle else 'running')
+            if status != self._last_status:
+                self._last_status = status
+                self.status_changed.emit(status)
+
             self.batch_done.emit(now_str)
+            if fresh_count:
+                self.batch_updated.emit(now_str, fresh_count)
+            try:
+                self.source_health_changed.emit(get_source_health())
+            except Exception as e:
+                print(f'[SourceHealth] {e}')
 
             # A-share kline async prefetch (every 30s, non-blocking)
             # 非交易时间跳过1分钟K线刷新（首次启动除外，避免空白）
@@ -565,79 +826,106 @@ class QuoteWorker(QThread):
                 time.sleep(0.1)
                 slept += 0.1
 
-    def _fetch_a_share_klines(self, codes):
-        """后台线程: 获取A股1分钟K线并缓存"""
+    def _run_kline_batch(self, tasks, fetch_one, label):
+        """并发预取一组 K 线；单票失败/超时不影响其他票，最终一定释放标志。"""
+        if not tasks:
+            return
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(KLINE_FETCH_WORKERS, len(tasks)),
+            thread_name_prefix=f'kline-{label}',
+        )
+        futures = {executor.submit(fetch_one, *task): task for task in tasks}
         try:
-            for code in codes:
-                if not self.running:
-                    break
+            for future in concurrent.futures.as_completed(
+                    futures, timeout=KLINE_FETCH_TIMEOUT):
+                task = futures[future]
                 try:
+                    cache_key, klines = future.result()
+                except Exception as e:
+                    print(f'[Kline {label}] {task} failed: {e}')
+                    continue
+                if klines:
+                    self._kline_put(cache_key, klines)
+        except concurrent.futures.TimeoutError:
+            print(f'[Kline {label}] 预取超过 {KLINE_FETCH_TIMEOUT}s，本轮未完成的请求跳过')
+        finally:
+            # 不阻塞取数主循环：仍卡在 HTTP 超时里的线程自行结束，不会阻止进程退出
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _fetch_a_share_klines(self, codes):
+        """后台线程: 获取A股1分钟K线并缓存（并发上限 4）"""
+        try:
+            self._run_kline_batch(
+                [(code,) for code in codes],
+                lambda code: (
+                    code,
                     # 分时全天化：拉当天全部1分钟K线（A股240根+缓冲），
                     # latest_day_only 按最后一根日期过滤出同一交易日，
                     # 得到"开盘至当前"的完整数据，而不是只看最近60根
-                    klines = get_kline_1min(code, 300, latest_day_only=True)
-                    if klines:
-                        self._kline_put(code, klines)
-                except Exception as e:
-                    print(f'[Kline Prefetch] {code} failed: {e}')
+                    get_kline_1min(code, 300, latest_day_only=True),
+                ),
+                'A股分时',
+            )
         finally:
             self._kline_fetching = False
 
     def _fetch_us_klines(self, codes):
-        """后台线程: 获取美股1分钟K线并缓存（Alpaca REST，feed=iex）"""
+        """后台线程: 获取美股1分钟K线并缓存（Alpaca REST，feed=iex，并发上限 4）"""
         try:
-            for code in codes:
-                if not self.running:
-                    break
-                try:
+            self._run_kline_batch(
+                [(code,) for code in codes],
+                lambda code: (
+                    code,
                     # 缓存键用配置里的原样代码（卡片按它取），请求用归一化后的代码
-                    klines = alpaca_history.get_kline(normalize_us_symbol(code) or code,
-                                                      '1min', 60)
-                    if klines:
-                        self._kline_put(code, klines)
-                except Exception as e:
-                    print(f'[US Kline Prefetch] {code} failed: {e}')
+                    alpaca_history.get_kline(
+                        normalize_us_symbol(code) or code, '1min', 60),
+                ),
+                '美股分时',
+            )
         finally:
             self._us_kline_fetching = False
 
     def _fetch_kline_period(self, code_period_pairs):
         """后台线程: 获取日K/周K并缓存（启动时+每小时刷新），按市场分流"""
+        from price_alert import get_kline
+
+        def fetch_one(code, period):
+            # 美股走 Alpaca，A股走东方财富/腾讯；日K预取顺带更新美股昨收缓存
+            if is_us_symbol(code):
+                klines = alpaca_history.get_kline(code, period, 60)
+            else:
+                klines = get_kline(code, period, 60)
+            return f'{code}_{period}', klines
+
         try:
-            from price_alert import get_kline
-            for code, period in code_period_pairs:
-                if not self.running:
-                    break
-                try:
-                    # 美股走 Alpaca，A股走东方财富/腾讯；日K预取顺带更新美股昨收缓存
-                    if is_us_symbol(code):
-                        klines = alpaca_history.get_kline(code, period, 60)
-                    else:
-                        klines = get_kline(code, period, 60)
-                    if klines:
-                        cache_key = f'{code}_{period}'
-                        self._kline_put(cache_key, klines)
-                except Exception as e:
-                    print(f'[Kline {period}] {code} failed: {e}')
+            self._run_kline_batch(code_period_pairs, fetch_one, '日周K')
         finally:
             self._kline_period_fetching = False
 
-    def _check_alert(self, name, code, price, target, direction):
-        # 判定口径与 QuoteCard 共用模块级 check_price_alert，避免两处分叉
-        hit, dir_cn = check_price_alert(price, target, direction)
-        if not hit:
-            return False, ''
-        return True, f'{name} {dir_cn} {target} | 当前: {price:.2f}'
+    def _latch_once(self, key, active):
+        """返回本次是否应提醒：同一条件持续为真只提醒一次，解除后可再次提醒。"""
+        if active:
+            if key in self.alert_latches:
+                return False
+            self.alert_latches.add(key)
+            return True
+        self.alert_latches.discard(key)
+        return False
 
-    def _check_pct_alert(self, name, code, change_pct, target_pct, pct_dir):
-        """涨跌幅预警：判定统一走模块级 check_pct_alert
-
-        写 3 表示 3%，方向由 pct_dir 决定（below=仅跌, above=仅涨, both=涨跌任一）
-        """
+    def _pct_hit(self, change_pct, target_pct, pct_dir):
+        """涨跌幅判定，返回 (是否命中, 实际方向中文)。"""
         hit, direction = check_pct_alert(change_pct, target_pct, pct_dir)
-        if not hit:
-            return False, ''
-        return True, f'{name} {direction}幅 {abs(change_pct):.2f}% 达到 {abs(target_pct)}%'
+        return (hit, direction) if hit else (False, '')
 
+    def _format_price_alert(self, name, code, price, target, direction):
+        label = DIR_LABELS.get(direction, '触发')
+        return (f'{name} {label} {format_price(code, target)} | '
+                f'当前: {format_price(code, price)}')
+
+    def _format_pct_alert(self, name, code, price, change_pct, target_pct, direction):
+        label = '跌' if direction == 'below' else '涨'
+        return (f'{name} {label}幅 {abs(change_pct):.2f}% '
+                f'达到 {abs(target_pct)}% | 当前: {format_price(code, price)}')
 
 
 # ============================================================
@@ -648,6 +936,11 @@ KLINE_SIZES = {
     'medium': (640, 360),   # 中（长宽各×2）
     'large':  (960, 540),   # 大（长宽各×3）
 }
+
+# K 线预取并发上限：免费接口对同一 IP 有频率限制，4 路足够覆盖几十只自选股；
+# 整体超时避免某个卡死的连接让本轮预取标志永远不释放。
+KLINE_FETCH_WORKERS = 4
+KLINE_FETCH_TIMEOUT = 20
 
 
 # ============================================================
@@ -728,6 +1021,8 @@ class KlineTooltip(QWidget):
         self.code = ''
         self.name = ''
         self.klines = []
+        self.period = '1min'
+        self.ref_close = None
 
     def mouseDoubleClickEvent(self, event):
         """双击K线图 = 关闭整个应用（与双击悬浮窗本体等效）"""
@@ -742,18 +1037,42 @@ class KlineTooltip(QWidget):
         self.hide()
         super().leaveEvent(event)
 
-    def set_data(self, code, name, klines):
+    def set_data(self, code, name, klines, ref_close=None, period='1min'):
         self.code = code
         self.name = name
         self.klines = klines
+        self.ref_close = ref_close
+        self.period = period
         self.update()
 
     def _price_fmt(self, price):
-        """根据代码返回格式化后的价格字符串（ETF/基金3位小数，其他2位）"""
-        code = self.code.lower()
-        if code.startswith(('sh51', 'sz15', 'sz16', 'sh50', 'sh58')):
-            return f'{price:.3f}'
-        return f'{price:.2f}'
+        """根据代码返回格式化后的价格字符串（统一走 price_alert 口径）。"""
+        return format_price(self.code, price)
+
+    def _change_pct(self):
+        """涨跌幅相对基准价，而不是首根开盘价。
+
+        分时优先用行情里的昨收；日K/周K用上一根收盘；都缺失时才退回首根开盘，
+        避免把「今天开盘以来涨幅」误当成「相对昨收涨跌幅」。
+        """
+        if not self.klines:
+            return 0.0
+        last_close = self.klines[-1].get('close')
+        reference = None
+        if self.period == '1min':
+            reference = self.ref_close
+        if reference is None and len(self.klines) > 1:
+            reference = self.klines[-2].get('close')
+        if reference is None:
+            reference = self.klines[0].get('open')
+        try:
+            reference = float(reference)
+            last_close = float(last_close)
+        except (TypeError, ValueError):
+            return 0.0
+        if reference <= 0 or not math.isfinite(reference) or not math.isfinite(last_close):
+            return 0.0
+        return (last_close - reference) / reference * 100
 
     @property
     def size_key(self):
@@ -783,17 +1102,13 @@ class KlineTooltip(QWidget):
 
         # 标题: 名称 + 代码 + 最新价
         last = self.klines[-1]
-        first = self.klines[0]
         p.setPen(QColor(get_color('text')))
         p.setFont(QFont('Microsoft YaHei UI', 9, QFont.Bold))
         title = f'{self.name}  {self.code}  {self._price_fmt(last["close"])}'
         p.drawText(10, 16, title)
 
-        # 涨跌幅（除的是首根开盘价，守卫也必须看它：Alpaca 缺字段时 open 会是 0）
-        if first['open'] > 0:
-            pct = ((last['close'] - first['open']) / first['open']) * 100
-        else:
-            pct = 0
+        # 涨跌幅相对昨收/上一根收盘（见 _change_pct），不再用首根开盘价。
+        pct = self._change_pct()
         pct_color = QColor(COLOR_UP) if pct >= 0 else QColor(COLOR_DOWN)
         pct_str = f'{pct:+.2f}%'
         p.setPen(pct_color)
@@ -866,6 +1181,13 @@ class KlineTooltip(QWidget):
 # ============================================================
 # 行情卡片 Widget（1/3 宽度紧凑版）
 # ============================================================
+# 卡片单行的硬需求宽度：name 70 + market 16 + price 70 + change 52 + time 40
+#   + 4 段间距 16 + 卡片左右边距 8 = 272。
+# 窗口要再让出 12 外边距 + 4 容器边框 + 4 列表边距 ≈ 292 才放得下时间列。
+# 窗口最小仍是 200：放不下时由 _apply_time_column_visibility 整列隐藏。
+CARD_TIME_MIN_WINDOW_WIDTH = 292
+
+
 class QuoteCard(QFrame):
     """紧凑行情卡片（窗口宽度 1/3）
 
@@ -879,6 +1201,7 @@ class QuoteCard(QFrame):
         self.code = code
         self.name = name
         self._triggered = False
+        self._stale = False
 
         self.setObjectName('quoteCard')
         self.setFixedHeight(24)
@@ -926,15 +1249,13 @@ class QuoteCard(QFrame):
         )
         layout.addWidget(self.change_label)
 
-        # 状态/触发信息（弹性）
-        self.status_label = QLabel('')
-        self.status_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.status_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 9px;')
-        layout.addWidget(self.status_label, 1)
+        # 弹性占位：把更新时间顶到卡片右缘。这里原先是个恒空的 status_label
+        # （预警只以绿底表达、不显示文字），标签本身只剩布局职责，改用显式 stretch。
+        layout.addStretch(1)
 
-        # 更新时间
+        # 更新时间（HH:MM；秒留给底栏和 tooltip，这里 48px 会让单行放不下）
         self.time_label = QLabel('')
-        self.time_label.setFixedWidth(48)
+        self.time_label.setFixedWidth(40)
         self.time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.time_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 8px;')
         layout.addWidget(self.time_label)
@@ -1119,13 +1440,7 @@ class QuoteCard(QFrame):
         currency_symbol = '$' if is_us_symbol(self.code) else '¥'
 
         if price is not None:
-            # ETF（510开头）和部分基金需要3位小数，其他股票2位
-            code = self.code.lower()
-            if code.startswith(('sh51', 'sz15', 'sz16', 'sh50', 'sh58')):
-                # ETF/基金：3位小数
-                self.price_label.setText(f'{currency_symbol}{price:,.3f}')
-            else:
-                self.price_label.setText(f'{currency_symbol}{price:,.2f}')
+            self.price_label.setText(f'{currency_symbol}{format_price(self.code, price)}')
         else:
             self.price_label.setText('--')
 
@@ -1140,30 +1455,20 @@ class QuoteCard(QFrame):
         else:
             self.change_label.setText('')
 
-        # 触发判断：目标价 OR 涨跌幅
+        # 触发判断：目标价 OR 涨跌幅。触发与否只以卡片绿底表达，不显示预警文字。
         triggered = False
-        trigger_reason = ''
 
         if target is not None and price is not None:
             # 判定口径与 QuoteWorker 共用模块级 check_price_alert，避免两处分叉
-            hit, dir_cn = check_price_alert(price, target, direction)
-            if hit:
-                triggered = True
-                # both 方向不展示具体破位方向，沿用原口径「双向」
-                label = '双向' if direction == 'both' else dir_cn
-                trigger_reason = f'{label}{target}'
+            hit, _ = check_price_alert(price, target, direction)
+            triggered = hit
 
         if not triggered and target_pct is not None and change_pct is not None:
             # 判定口径与 QuoteWorker 共用同一函数，避免两处逻辑再次分叉
-            pct_hit, direction_cn = check_pct_alert(
+            pct_hit, _ = check_pct_alert(
                 change_pct, target_pct, data.get('pct_dir', 'both')
             )
-            if pct_hit:
-                triggered = True
-                trigger_reason = f'{direction_cn}≥{abs(target_pct)}%'
-
-        # 状态显示：不显示预警文字，仅通过绿色底色表示触发
-        self.status_label.setText('')
+            triggered = pct_hit
 
         # 只在状态变化时切换样式
         if triggered and not self._triggered:
@@ -1178,16 +1483,55 @@ class QuoteCard(QFrame):
             f'border: 1px solid {get_color("border")}; border-radius: 2px;'
         )
 
+        # 卡片自己的更新时间：之前只读不走，卡片永远没有「上次成功更新」的时间。
+        self._stale = bool(data.get('stale'))
+        stamp = str(last_update or '--')
+        # 单行只有 40px 放时间，秒挤不进去；完整 HH:MM:SS 留在 tooltip 和底栏
+        self.time_label.setText(stamp[:5])
+        self.time_label.setToolTip(
+            ('非交易时段收盘价（不参与预警）' if self._stale
+             else '最近一次成功取数时间') + f'  {stamp}'
+        )
+        if self._stale:
+            self.time_label.setStyleSheet(f'color: {COLOR_FLAT}; font-size: 8px;')
+        else:
+            self.time_label.setStyleSheet(
+                f'color: {get_color("text_dim")}; font-size: 8px;'
+            )
+        self._apply_price_style()
+
+        # position / note 一直只存不显示。卡片名称是截断渲染的，悬停这里同时补全名。
+        lines = [f'{self.name}  {self.code}']
+        if position:
+            lines.append(f'持仓: {position}')
+        if note:
+            lines.append(f'备注: {note}')
+        self.name_label.setToolTip('\n'.join(lines))
+
+    def _apply_price_style(self):
+        """非实时价（收盘价/停止更新）置灰，避免用户把整晚不动的旧价当成实时价。
+
+        主题切换也要走这里，否则换肤会把灰掉的价格刷回正常色。
+        """
+        color = COLOR_FLAT if self._stale else get_color('text')
+        self.price_label.setStyleSheet(
+            f'color: {color}; font-size: 12px; font-weight: 700;'
+        )
+
+    def set_time_visible(self, visible):
+        """窄窗口下整列隐藏更新时间。
+
+        水平滚动条是关掉的，放不下时切掉半截比干净地不显示更糟。
+        """
+        self.time_label.setVisible(bool(visible))
+
     def _on_theme_changed(self):
         """主题切换时刷新所有标签颜色"""
         self.name_label.setStyleSheet(
             f'color: {get_color("text")}; font-size: 10px; font-weight: 600;'
         )
-        self.price_label.setStyleSheet(
-            f'color: {get_color("text")}; font-size: 12px; font-weight: 700;'
-        )
+        self._apply_price_style()
         self.time_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 8px;')
-        self.status_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 9px;')
         # 市场标签
         self.market_label.setStyleSheet(
             f'color: {get_color("text_dim")}; font-size: 9px;'
@@ -1230,18 +1574,23 @@ class _StockResolveThread(QThread):
                     name = ''
                 candidates = [(us_sym, name)]
 
-            # 已带前缀
-            elif lower_text.startswith(('sh', 'sz', 'hk', 'bj')):
+            # 已带前缀：沪深代码（含大写/s_ 写法）归一后照常解析名称
+            elif normalize_a_share_code(text):
+                canonical = normalize_a_share_code(text)
                 try:
-                    q = get_quote_tencent(text)
+                    q = get_quote_tencent(canonical)
                     name = q.get('name', '')
                     price = q.get('price')
-                    if name and name != text and price and price > 0:
-                        candidates = [(text, name)]
+                    if name and name != canonical and price and price > 0:
+                        candidates = [(canonical, name)]
                     else:
-                        candidates = [(text, '')]
+                        candidates = [(canonical, '')]
                 except Exception:
-                    candidates = [(text, '')]
+                    candidates = [(canonical, '')]
+
+            # 北交所/港股暂不支持：不再生成会被数据层静默丢弃的候选
+            elif is_bj_code(text) or lower_text.startswith('hk'):
+                candidates = []
 
             # 6位数字: sh 和 sz 两边都查
             elif text.isdigit() and len(text) == 6:
@@ -1317,6 +1666,26 @@ class AlpacaCredsDialog(QDialog):
 # ============================================================
 # 设置对话框（增删改监控股票）
 # ============================================================
+class _NumericColumnDelegate(QStyledItemDelegate):
+    """目标价 / 目标% 两列的编辑器只收数字，非法字符在输入时就被挡掉。
+
+    保存时的逐行校验仍然保留，它才是最终判定：空单元格表示「不设这条预警」，
+    而「目标价必须 > 0」「目标% 不能为 0」这类跨字段规则 validator 表达不了。
+    显式钉成 C locale，否则部分区域设置下小数点会被判成非法输入。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.validator = QDoubleValidator(0.0, 1000000.0, 3)
+        self.validator.setNotation(QDoubleValidator.StandardNotation)
+        self.validator.setLocale(QLocale.c())
+
+    def createEditor(self, parent, option, index):
+        editor = super().createEditor(parent, option, index)
+        editor.setValidator(self.validator)
+        return editor
+
+
 class SettingsDialog(QDialog):
     config_changed = Signal(dict)
 
@@ -1425,6 +1794,10 @@ class SettingsDialog(QDialog):
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.SelectedClicked)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        # 2=目标价 4=目标%：输入层只收数字（保存时的逐行校验仍是最终判定）
+        self._numeric_delegate = _NumericColumnDelegate(self.table)
+        self.table.setItemDelegateForColumn(2, self._numeric_delegate)
+        self.table.setItemDelegateForColumn(4, self._numeric_delegate)
         self.table.setStyleSheet(
             f'QTableWidget {{ gridline-color: {get_color("border")};'
             f'  background: {get_color("bg")}; alternate-background-color: {get_color("bg_light")};'
@@ -1595,8 +1968,14 @@ class SettingsDialog(QDialog):
         if not code:
             return
 
-        # 已带前缀的不再重复查询（美股不带前缀，需走解析线程补名称）
-        if code.lower().startswith(('sh', 'sz', 'hk', 'bj')):
+        # 沪深代码（含大写/s_）统一归一再解析；北交所/港股不发起无意义请求。
+        canonical = normalize_a_share_code(code)
+        if canonical and canonical != code:
+            self._block_signals = True
+            item.setText(canonical)
+            self._block_signals = False
+            code = canonical
+        if is_bj_code(code) or code.lower().startswith('hk'):
             return
 
         name_item = self.table.item(row, 1)
@@ -1681,6 +2060,8 @@ class SettingsDialog(QDialog):
 
     def _save_and_close(self):
         alerts = []
+        errors = []
+        seen_codes = set()
         for row in range(self.table.rowCount()):
             code_item = self.table.item(row, 0)
             name_item = self.table.item(row, 1)
@@ -1690,44 +2071,58 @@ class SettingsDialog(QDialog):
             pct_dir_combo = self.table.cellWidget(row, 5)
             pos_combo = self.table.cellWidget(row, 6)
             note_item = self.table.item(row, 7)
+            row_label = f'第 {row + 1} 行'
 
             code = code_item.text().strip() if code_item else ''
             if not code:
                 continue
-            # 保存时校验代码格式（A股 或 美股），避免脏代码入库（取数时会被静默忽略）
-            c_low = code.lower()
-            is_a_format = (c_low[:2] in ('sh', 'sz', 'bj') and c_low[2:].isdigit() and len(c_low) == 8)
-            if is_a_format:
-                pass
-            elif is_us_symbol(code):
-                code = normalize_us_symbol(code)   # 美股统一存大写（AAPL / BRK.B）
+
+            # 代码格式：A 股归一小写/s_ 前缀；美股统一大写；北交所明确拒绝。
+            us_code = normalize_us_symbol(code)
+            a_code = normalize_a_share_code(code)
+            if us_code:
+                code = us_code
+            elif a_code:
+                code = a_code
+            elif is_bj_code(code):
+                errors.append(f'{row_label}：暂不支持北交所代码「{code}」（仅支持沪深 sh/sz）')
+                continue
             else:
-                QMessageBox.warning(
-                    self, '代码格式错误',
-                    f'「{code}」不是合法代码（A股: sh/sz/bj + 6位数字；美股: 1-5位字母如 AAPL），已跳过',
+                errors.append(
+                    f'{row_label}：「{code}」不是合法代码'
+                    '（A股 sh/sz + 6位数字；美股 1-5位字母如 AAPL）'
                 )
                 continue
 
+            if code in seen_codes:
+                errors.append(f'{row_label}：代码「{code}」重复')
+                continue
+            seen_codes.add(code)
+
             name = name_item.text().strip() if name_item else code
 
-            target_text = target_item.text().strip() if target_item else ''
             target = None
+            target_text = target_item.text().strip() if target_item else ''
             if target_text:
-                try:
-                    target = float(target_text)
-                except ValueError:
-                    target = None
+                target = _finite_float(target_text)
+                if target is None or target <= 0:
+                    errors.append(f'{row_label}：目标价「{target_text}」必须是大于 0 的数字')
+                    continue
 
-            target_pct_text = pct_target_item.text().strip() if pct_target_item else ''
             target_pct = None
+            target_pct_text = pct_target_item.text().strip() if pct_target_item else ''
             if target_pct_text:
-                try:
-                    target_pct = float(target_pct_text)
-                except ValueError:
-                    target_pct = None
+                target_pct = _finite_float(target_pct_text)
+                if target_pct is None or target_pct == 0:
+                    errors.append(f'{row_label}：目标涨跌幅「{target_pct_text}」必须是非零数字')
+                    continue
+                target_pct = abs(target_pct)
 
             direction = dir_combo.currentData() if dir_combo and dir_combo.currentData() else 'below'
             pct_dir = pct_dir_combo.currentData() if pct_dir_combo and pct_dir_combo.currentData() else 'both'
+            if direction not in VALID_DIRECTIONS or pct_dir not in VALID_DIRECTIONS:
+                errors.append(f'{row_label}：预警方向不合法')
+                continue
             position = pos_combo.currentText() if pos_combo else ''
             note = note_item.text().strip() if note_item else ''
 
@@ -1741,6 +2136,16 @@ class SettingsDialog(QDialog):
                 'position': position,
                 'note': note,
             })
+
+        if errors:
+            detail = '\n'.join(errors[:10])
+            if len(errors) > 10:
+                detail += f'\n……另有 {len(errors) - 10} 条错误'
+            QMessageBox.warning(
+                self, '配置有误，未保存',
+                '请修正以下问题后再保存：\n\n' + detail,
+            )
+            return
 
         self.config['interval'] = self.interval_spin.value()
         self.config['kline_size'] = self.kline_size_combo.currentText()
@@ -1775,11 +2180,12 @@ class FloatingWindow(QWidget):
         self.config = load_config()
         self.cards = {}
         self.worker = None
-        self.start_time = None
         self._drag_offset = None
         self._kline_tooltip = None
         self._kline_fetcher = None
         self._settings_dialog = None
+        self._shutting_down = False
+        self._last_quotes = {}
         self.us_name_backfilled.connect(self._on_us_name_backfilled)
 
         # 系统托盘
@@ -1888,7 +2294,7 @@ class FloatingWindow(QWidget):
         h.setContentsMargins(6, 0, 6, 0)
         h.setSpacing(4)
 
-        # 左侧：状态点 + 更新时间 + 运行时长
+        # 左侧：状态点 + 更新时间
         self.status_dot = QLabel('●')
         self.status_dot.setStyleSheet(f'color: {COLOR_FLAT}; font-size: 9px;')
         h.addWidget(self.status_dot)
@@ -1897,9 +2303,13 @@ class FloatingWindow(QWidget):
         self.update_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 9px;')
         h.addWidget(self.update_label)
 
-        self.uptime_label = QLabel('')
-        self.uptime_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 9px;')
-        h.addWidget(self.uptime_label)
+        # 数据源健康：5/5 表示五路 A 股源均可用；红/黄提示被临时屏蔽
+        self.source_label = QLabel('源 --')
+        self.source_label.setStyleSheet(
+            f'color: {get_color("text_dim")}; font-size: 8px;'
+        )
+        self.source_label.setToolTip('A 股数据源健康状态')
+        h.addWidget(self.source_label)
 
         h.addStretch()
 
@@ -1940,6 +2350,20 @@ class FloatingWindow(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         self._drag_offset = None
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_time_column_visibility()
+
+    def _apply_time_column_visibility(self):
+        """窗口太窄放不下更新时间整列时把它藏起来，而不是裁成半截。
+
+        判断挂在窗口宽度上、不挂在卡片 width() 上：卡片一旦显示时间列，
+        自身最小宽就被顶到 272，width() 永远不会小于阈值，条件自锁。
+        """
+        show = self.width() >= CARD_TIME_MIN_WINDOW_WIDTH
+        for card in getattr(self, 'cards', {}).values():
+            card.set_time_visible(show)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         """双击任意位置关闭程序"""
@@ -2012,7 +2436,7 @@ class FloatingWindow(QWidget):
             if code in seen:
                 continue
             seen[code] = item
-            name = item.get('name', code)
+            name = item.get('name') or code
             card = QuoteCard(code, name)
             card.set_data({
                 'price': None, 'change_pct': None,
@@ -2046,7 +2470,9 @@ class FloatingWindow(QWidget):
             list_content_h = 0
         total_h = OUTER_MARGIN_H + CONTAINER_BORDER_H + list_content_h + BOTTOM_BAR_H + BUFFER_H
 
-        self.resize(280, total_h)
+        # 300 而不是 280：卡片单行含更新时间需要 292，280 会让它一上线就被裁掉
+        self.resize(300, total_h)
+        self._apply_time_column_visibility()
         # 重置滚动区域最小高度
         self.scroll.setMinimumHeight(0)
 
@@ -2085,7 +2511,7 @@ class FloatingWindow(QWidget):
         self.list_widget.setStyleSheet(f'QWidget {{ background: {get_color("bg")}; }}')
         # 底栏标签
         self.update_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 9px;')
-        self.uptime_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 9px;')
+        self.source_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 8px;')
         self.btn_settings.setStyleSheet(
             f'QPushButton {{ background: {get_color("bg_light")}; color: {get_color("text")};'
             f'  border: 1px solid {get_color("border")}; border-radius: 4px; font-size: 11px; }}'
@@ -2126,8 +2552,14 @@ class FloatingWindow(QWidget):
                 print('[Monitor] 旧取数线程 2 秒内未退出，等它真正结束后自动重启')
                 old.finished.connect(self._restart_monitor)
         self._rebuild_cards()
-        if was_running and old.isFinished():
-            self.start_monitor()
+        if was_running:
+            # 没等到退出时已挂 finished→_restart_monitor，由它负责重启
+            if old.isFinished():
+                self.start_monitor()
+        else:
+            # 线程早已死掉/还没启动过（状态红点）：只重建卡片的话，用户改完设置
+            # 看到的是新股票列表配旧行情，且要再等 5 秒自愈才动。立即拉起。
+            self._restart_monitor()
 
     def _apply_alpaca_config(self):
         """把 Alpaca 配置注入数据层，并按监控列表启停 WebSocket 线程
@@ -2195,42 +2627,57 @@ class FloatingWindow(QWidget):
             card._update_name_elided()
 
     def _restart_monitor(self):
-        """旧取数线程真正退出后补一次重启（见 _on_config_changed 的超时分支）"""
+        """补一次重启：设置保存超时分支 / 线程连续异常自愈共用。"""
+        if getattr(self, '_shutting_down', False):
+            return
         if self.worker is not None and self.worker.isRunning():
             return
         self.start_monitor()
 
+    def _on_worker_finished(self, worker=None):
+        """取数线程退出：非用户停止且是连续异常时，5 秒后自动重建。
+
+        finished 直接连到本方法（不套 lambda），保证槽在主线程执行；
+        槽内用 sender() 取回对应 worker，避免旧线程退出误触发重启。
+        """
+        if worker is None:
+            worker = self.sender()
+        if worker is not self.worker or getattr(self, '_shutting_down', False):
+            return
+        if not getattr(worker, 'fatal_error', False):
+            return
+        print('[Monitor] 取数线程连续异常已退出，5 秒后自动重启')
+        self.worker = None
+        worker.deleteLater()
+        QTimer.singleShot(5000, self._restart_monitor)
+
     def start_monitor(self):
+        if getattr(self, '_shutting_down', False):
+            return
         if self.worker and self.worker.isRunning():
             return
+        if self.worker is not None:
+            # 已结束的旧对象及时释放，避免 restart 时引用链越积越长
+            self.worker.deleteLater()
+            self.worker = None
         self.config = load_config()
-        # 应用TDX自定义节点配置
-        tdx_host = self.config.get('tdx_host', '')
-        if tdx_host:
-            import price_alert
-            price_alert.TDX_NODES = [
-                {'id': 'custom', 'name': f'自定义({tdx_host})', 'host': tdx_host, 'priority': 1}
-            ]
-            price_alert.DEFAULT_TDX_HOST = tdx_host
+        # TDX 节点：tdx_host 为空时必须恢复内置节点（清空自定义服务器后的复位的）
+        _apply_tdx_config(self.config)
         # 美股（Alpaca）：注入凭证 + 启动实时 WebSocket（历史K线由 REST 按需拉取）
         self._apply_alpaca_config()
         self._rebuild_cards()
         # 凭证就绪后，给名称为空的美股代码后台补名称（首次会全量拉 assets，约1-2秒）
         self._backfill_us_names()
-        self.worker = QuoteWorker(self.config)
-        self.worker.quote_updated.connect(self.on_quote)
-        self.worker.alert_triggered.connect(self.on_alert)
-        self.worker.status_changed.connect(self.on_status)
-        self.worker.batch_done.connect(self.on_batch_done)
-        self.worker.start()
-        self.start_time = datetime.datetime.now()
-        # 复用同一个定时器：原先每次重启都 new 一个 QTimer(self)，旧的一直在 1 秒一跳，
-        # 每保存一次设置就泄漏一个活动定时器（长跑进程内存持续增长）
-        if not hasattr(self, '_uptime_timer'):
-            self._uptime_timer = QTimer(self)
-            self._uptime_timer.timeout.connect(self._update_uptime)
-        self._uptime_timer.start(1000)
-
+        worker = QuoteWorker(self.config)
+        worker.quote_updated.connect(self.on_quote)
+        worker.alert_triggered.connect(self.on_alert)
+        worker.status_changed.connect(self.on_status)
+        worker.batch_done.connect(self.on_batch_done)
+        worker.batch_updated.connect(self.on_batch_updated)
+        worker.source_health_changed.connect(self.on_source_health)
+        worker.finished.connect(self._on_worker_finished)
+        self.worker = worker
+        worker.start()
 
     def stop_monitor(self):
         if self.worker:
@@ -2241,8 +2688,6 @@ class FloatingWindow(QWidget):
             else:
                 self.worker = None
         alpaca_stream.stop()   # 停实时流线程（daemon，随进程退出也会自己结束）
-        if hasattr(self, '_uptime_timer'):
-            self._uptime_timer.stop()
         self.status_dot.setStyleSheet(f'color: {COLOR_FLAT}; font-size: 9px;')
 
     def show_kline_for_card(self, code, name, mouse_pos, period='1min'):
@@ -2255,10 +2700,15 @@ class FloatingWindow(QWidget):
             cached = self.worker._kline_get(cache_key)
             if cached:
                 klines = cached[1]
+        quote = self._last_quotes.get(code) or {}
         # 有缓存则显示；无缓存（日K/周K尚未加载）也显示空态，保持位置稳定
-        self._show_kline_tooltip(code, name, klines, mouse_pos, period)
+        self._show_kline_tooltip(
+            code, name, klines, mouse_pos, period,
+            ref_close=quote.get('yest_close'),
+        )
 
-    def _show_kline_tooltip(self, code, name, klines, mouse_pos, period='1min'):
+    def _show_kline_tooltip(self, code, name, klines, mouse_pos, period='1min',
+                            ref_close=None):
         """显示K线悬浮图, 智能定位
         切换周期时若tooltip已可见，仅更新数据不重定位，避免图跳动
         """
@@ -2271,11 +2721,13 @@ class FloatingWindow(QWidget):
             self._kline_tooltip = KlineTooltip(size_key, main_window=self)
 
         already_visible = self._kline_tooltip.isVisible()
-        self._kline_tooltip.set_data(code, name, klines)
+        self._kline_tooltip.set_data(code, name, klines, ref_close, period)
 
         # 仅在首次显示时定位；切周期时保持位置不变
         if not already_visible:
-            screen = QApplication.primaryScreen().availableGeometry()
+            # 用鼠标所在屏幕，而不是主屏：多显示器下右侧副屏会算到主屏边界外
+            screen_obj = QApplication.screenAt(mouse_pos) or QApplication.primaryScreen()
+            screen = screen_obj.availableGeometry()
             tip_w = self._kline_tooltip.width()
             tip_h = self._kline_tooltip.height()
 
@@ -2326,6 +2778,7 @@ class FloatingWindow(QWidget):
 
     def on_quote(self, data):
         code = data.get('code')
+        self._last_quotes[code] = dict(data)
         card = self.cards.get(code)
         if card:
             card.set_data(data)
@@ -2334,11 +2787,12 @@ class FloatingWindow(QWidget):
         """预警触发时显示系统托盘通知并唤醒窗口"""
         name = data.get('name', '')
         message = data.get('message', '')
-        price = data.get('price', 0)
+        code = data.get('code', '')
+        price = data.get('price')
         if self._tray_icon and self._tray_icon.isSystemTrayAvailable():
             self._tray_icon.showMessage(
                 f'{name} 预警触发',
-                f'{message} | 当前价: {price:.2f}',
+                message,
                 QSystemTrayIcon.Warning,
                 5000,
             )
@@ -2349,32 +2803,74 @@ class FloatingWindow(QWidget):
             self.activateWindow()
 
     def on_status(self, status):
-        if status == 'running':
-            self.status_dot.setStyleSheet(f'color: {COLOR_DOWN}; font-size: 9px;')
-        elif status == 'stopped':
-            self.status_dot.setStyleSheet(f'color: {COLOR_FLAT}; font-size: 9px;')
-        elif status == 'error':
-            self.status_dot.setStyleSheet(f'color: {COLOR_ALERT}; font-size: 9px;')
+        """状态点四态：正常绿 / 休市蓝 / 停止灰 / 故障红，悬停给出原因。
+
+        休市必须和「正常在跑」分开：两者界面表现一致（数字都不动），
+        用户没法判断是没到点还是取数卡住了。
+        """
+        states = {
+            'running': (COLOR_DOWN, '行情刷新正常'),
+            'closed': (COLOR_CLOSED, '非交易时段：不刷新属预期，恢复交易后自动继续'),
+            'stopped': (COLOR_FLAT, '取数线程已停止'),
+            'error': (COLOR_ALERT, '连续取数失败，正在自动重试'),
+        }
+        color, tip = states.get(status, (COLOR_FLAT, status))
+        self.status_dot.setStyleSheet(f'color: {color}; font-size: 9px;')
+        self.status_dot.setToolTip(tip)
 
     def on_batch_done(self, now_str):
-        self.update_label.setText(now_str)
+        """一轮结束心跳。这里不刷新「更新时间」：休市/全部取数失败时
+        batch_done 照样会来，用它当更新时间会显示一个假的「刚刚更新」。"""
+        return
 
-    def _update_uptime(self):
-        if not self.start_time:
+    def on_batch_updated(self, now_str, count):
+        """仅在本轮确实拿到有效行情时刷新更新时间，避免假新鲜。"""
+        self.update_label.setText(now_str)
+        self.update_label.setToolTip(f'最近一次有效行情 {now_str}（本轮 {count} 条）')
+
+    def on_source_health(self, snapshot):
+        """刷新底栏数据源健康提示：可用/总数，被临时屏蔽的源列在 tooltip。"""
+        if not isinstance(snapshot, dict) or not snapshot:
             return
-        delta = datetime.datetime.now() - self.start_time
-        total = int(delta.total_seconds())
-        h, rem = divmod(total, 3600)
-        m, s = divmod(rem, 60)
-        if h > 0:
-            self.uptime_label.setText(f'{h}:{m:02d}:{s:02d}')
-        else:
-            self.uptime_label.setText(f'{m}:{s:02d}')
+        total = len(snapshot)
+        disabled = [
+            str(info.get('label') or name)
+            for name, info in snapshot.items()
+            if not info.get('available')
+        ]
+        available = total - len(disabled)
+        self.source_label.setText(f'源 {available}/{total}')
+        if not disabled:
+            self.source_label.setStyleSheet(
+                f'color: {get_color("text_dim")}; font-size: 8px;'
+            )
+            self.source_label.setToolTip('A 股数据源全部可用')
+            return
+        color = COLOR_ALERT if available == 0 else COLOR_FLAT
+        self.source_label.setStyleSheet(f'color: {color}; font-size: 8px;')
+        self.source_label.setToolTip(
+            '临时屏蔽: ' + '、'.join(disabled) + '\n屏蔽 300 秒后自动恢复'
+        )
 
     def closeEvent(self, event):
-        if self.worker:
-            self.worker.stop()
-            self.worker.wait(2000)
+        # 先落关闭标记：worker.finished 的自愈回调据此不再重建线程
+        self._shutting_down = True
+        if getattr(self, '_theme_timer', None) is not None:
+            self._theme_timer.stop()
+        if self._kline_tooltip is not None:
+            self._kline_tooltip.close()
+            self._kline_tooltip = None
+        if self._tray_icon is not None:
+            self._tray_icon.hide()
+        worker = self.worker
+        if worker is not None:
+            worker.stop()
+            if not worker.wait(3000):
+                # 仍在阻塞请求里的线程由进程退出兜底；提前置空会析构运行中的
+                # QThread 并触发 abort，所以这里保留引用
+                print('[Monitor] 取数线程 3 秒内未退出，随进程退出')
+            else:
+                self.worker = None
         try:
             alpaca_stream.stop()
         except Exception:
@@ -2394,12 +2890,28 @@ class FloatingWindow(QWidget):
 # 入口
 # ============================================================
 def main():
+    setup_logging()
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName('Stock Monitor')
+
+    # 单实例：QLockFile 同时避免两个进程写同一份自选股配置、双份托盘图标，
+    # 以及重复消耗免费行情接口配额。锁随进程退出自动释放，崩溃后按默认
+    # 30 秒过期策略处理。
+    instance_lock = QLockFile(os.path.join(_data_dir(), 'stock-monitor.lock'))
+    if not instance_lock.tryLock(200):
+        QMessageBox.information(
+            None, 'Stock Monitor',
+            '程序已经在运行。\n\n'
+            '如果确认没有窗口，可能是上次异常退出残留了锁文件：\n'
+            f'{instance_lock.fileName()}',
+        )
+        return 1
+    app.aboutToQuit.connect(instance_lock.unlock)
+
     font = QFont('Microsoft YaHei UI', 9)
     app.setFont(font)
 
@@ -2410,11 +2922,12 @@ def main():
     print(f'  Stock Monitor Floating Window v{VERSION}')
     print(f'  Started: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
     print(f'  Config: {CONFIG_FILE}')
+    print(f'  Log: {LOG_FILE}')
     print('=' * 50)
 
-    sys.exit(app.exec())
+    return app.exec()
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
 
