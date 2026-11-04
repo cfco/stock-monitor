@@ -1,6 +1,6 @@
 name: Build Releases
 
-# 推 tag（如 v5.2.1）自动构建 Windows EXE + Linux 二进制并发布 Release；
+# 推 tag（如 v5.3.0）自动构建 Windows EXE + Linux 二进制并发布 Release；
 # 也可在 Actions 页面手动触发
 on:
   push:
@@ -27,7 +27,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest PySide6-Essentials eltdx websocket-client tzdata
+          pip install -r requirements.txt pytest
 
       # 单测里有 Qt 控件用例（删行/回调/取数线程），无显示环境需要 offscreen 平台插件
       - name: Run tests
@@ -52,7 +52,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install PySide6-Essentials eltdx pyinstaller websocket-client tzdata
+          pip install -r requirements.txt pyinstaller
 
       # 产物里随包的默认配置必须用模板：直接用本机 scripts/watchlist_config.json
       # 会把开发者自己的自选股（含加密凭证）打进对外发布的 exe
@@ -125,7 +125,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install PySide6-Essentials eltdx pyinstaller websocket-client tzdata
+          pip install -r requirements.txt pyinstaller
 
       - name: Use template config for packaging
         run: cp scripts/watchlist_config.example.json scripts/watchlist_config.json

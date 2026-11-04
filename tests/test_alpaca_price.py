@@ -3,6 +3,7 @@
 数值取自 2026-10-29 实测：ET 05:28（盘前）AAPL bp=325.91 / ap=360.46 / p=None，
 昨收 347.10 —— 旧口径取中值 343.19，界面会显示 -1.13% 的假跌幅。
 """
+import datetime
 import os
 import sys
 
@@ -64,8 +65,13 @@ def test_same_day_filter_drops_previous_session_bars():
 
 def test_bad_bar_does_not_take_down_the_whole_batch():
     """一只票的坏 bar 不能让整批美股当轮没行情（原先是 bars[1]['c'] 裸下标）"""
-    prev, latest = H._resolve_prev_close([{'t': '2026-10-28T04:00:00Z', 'c': 10.0},
-                                          {'t': 'bad'}])
+    # 固定 now_et：最新 bar 必须是「今天」，否则会走进盘前/休市口径，
+    # 结果是 prev=latest，测试本身随运行时间漂移。
+    now_et = datetime.datetime(2026, 10, 28, 12, 0, tzinfo=H.TZ_ET)
+    prev, latest = H._resolve_prev_close(
+        [{'t': '2026-10-28T04:00:00Z', 'c': 10.0}, {'t': 'bad'}],
+        now_et=now_et,
+    )
     assert latest == 10.0 and prev is None
-    prev, latest = H._resolve_prev_close([{'c': None}])
+    prev, latest = H._resolve_prev_close([{'c': None}], now_et=now_et)
     assert (prev, latest) == (None, None)

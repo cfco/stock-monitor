@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul 2>&1
-setlocal enabledelayedexpansion
+setlocal
 
 set SCRIPT_DIR=%~dp0
 cd /d "%SCRIPT_DIR%"
@@ -10,11 +10,16 @@ if not exist ".venv\Scripts\python.exe" (
     echo [INFO] Creating virtual environment...
     where uv >nul 2>&1
     if not errorlevel 1 (
-        uv venv --clear
         uv sync
     ) else (
+        where python >nul 2>&1
+        if errorlevel 1 (
+            echo [ERROR] Python 3.10+ not found. Install Python or uv first.
+            pause
+            exit /b 1
+        )
         python -m venv .venv
-        .venv\Scripts\pip install --quiet PySide6-Essentials eltdx
+        .venv\Scripts\python.exe -m pip install --quiet -r requirements.txt
     )
     if errorlevel 1 (
         echo [ERROR] Setup failed. Please run manually.
@@ -23,8 +28,6 @@ if not exist ".venv\Scripts\python.exe" (
     )
 )
 
-REM === Launch with pythonw (no console window) ===
-:loop
-start "" /min ".venv\Scripts\pythonw.exe" "%SCRIPT_DIR%floating_window.py"
-timeout /t 5 /nobreak >nul
-goto loop
+REM === Launch once (no restart loop; the app has its own single-instance lock) ===
+start "" ".venv\Scripts\pythonw.exe" "%SCRIPT_DIR%floating_window.py"
+exit /b 0

@@ -18,6 +18,8 @@ dist/
 # 运行产物
 reports/
 *.log
+logs/
+stock-monitor.lock
 .screenshots/
 
 # 本机实际配置：含自选股与 DPAPI 加密的 Alpaca 凭证，不进版本库
