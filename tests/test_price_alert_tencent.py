@@ -38,11 +38,15 @@ class _FakeResponse:
 
 
 def _build_inner(name, code, price, yest, opn, chg, high, low):
-    """构造腾讯内部 ~ 分隔串（索引0为前缀'1'，与真实接口一致）。"""
+    """构造腾讯内部 ~ 分隔串（索引0为前缀'1'，与真实接口一致）。
+
+    真实接口 f[2] 只有 6 位数字（如 ``601398``），市场前缀在外层变量名
+    ``v_sh601398`` 上；这里按真实格式生成，避免测试继续制造假兼容。
+    """
     fields = [''] * 35
     fields[0] = '1'
     fields[1] = name
-    fields[2] = code
+    fields[2] = code[2:] if code.lower().startswith(('sh', 'sz')) else code
     fields[3] = str(price)
     fields[4] = str(yest)
     fields[5] = str(opn)
@@ -106,6 +110,58 @@ def test_batch_quote(patch_http):
     assert set(res.keys()) == {'sh601398', 'sz000001'}
     assert res['sh601398']['price'] == 6.12
     assert res['sz000001']['name'] == '平安银行'
+
+
+def test_batch_real_format_maps_by_variable_name(patch_http):
+    """真实返回里 f[2] 只有 6 位数字，必须靠外层 v_<code> 变量名映射。"""
+    payload = (
+        'v_sh601398="' + _build_inner('工商银行', 'sh601398',
+                                      6.12, 6.00, 6.01, 2.0, 6.20, 5.95) + '";'
+        'v_sz000001="' + _build_inner('平安银行', 'sz000001',
+                                      12.34, 12.00, 12.10, 2.83, 12.5, 11.9) + '";'
+    )
+    patch_http(payload)
+    res = price_alert.get_quotes_tencent_batch(['sh601398', 'sz000001'])
+    assert res['sh601398']['name'] == '工商银行'
+    assert res['sh601398']['code'] == 'sh601398'
+    assert res['sz000001']['name'] == '平安银行'
+
+
+def test_batch_duplicate_six_digits_disambiguated_by_prefix(patch_http):
+    """上证指数 sh000001 与平安银行 sz000001 的 6 位数字相同，不能错挂。"""
+    payload = _multi_payload([
+        ('sh000001', '上证指数', 3200.0, 3180.0, 3190.0, 0.63, 3210.0, 3175.0),
+        ('sz000001', '平安银行', 12.34, 12.00, 12.10, 2.83, 12.5, 11.9),
+    ])
+    patch_http(payload)
+    res = price_alert.get_quotes_tencent_batch(['sh000001', 'sz000001'])
+    assert res['sh000001']['name'] == '上证指数'
+    assert res['sz000001']['name'] == '平安银行'
+
+
+def test_batch_does_not_cross_assign_other_market(patch_http):
+    """请求 sh000001，返回的却是 v_sz000001：宁可丢弃，也不能把深市行情挂到沪市。"""
+    payload = _single_payload('sz000001', name='平安银行', price=12.34)
+    patch_http(payload)
+    assert price_alert.get_quotes_tencent_batch(['sh000001']) == {}
+
+
+def test_batch_rejects_inconsistent_variable_and_inner_code(patch_http):
+    """变量名是 sh601398、内部 f[2] 却是 sz000001：响应自相矛盾，整条丢弃。"""
+    fields = _build_inner('工商银行', 'sh601398',
+                          6.12, 6.00, 6.01, 2.0, 6.20, 5.95).split('~')
+    fields[2] = 'sz000001'
+    patch_http('v_sh601398="' + '~'.join(fields) + '";')
+    assert price_alert.get_quotes_tencent_batch(['sh601398']) == {}
+
+
+def test_batch_drops_zero_and_invalid_price(patch_http):
+    payload = _multi_payload([
+        ('sh601398', '工商银行', 0, 6.00, 6.01, 0, 6.20, 5.95),
+        ('sz000001', '平安银行', 'nan', 12.00, 12.10, 0, 12.5, 11.9),
+    ])
+    patch_http(payload)
+    assert price_alert.get_quotes_tencent_batch(['sh601398', 'sz000001']) == {}
 
 
 def test_sqt_batch_quote(patch_http):
