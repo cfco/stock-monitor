@@ -1,15 +1,25 @@
 name: Build Releases
 
-# 推 tag（如 v5.3.0）自动构建 Windows EXE + Linux 二进制并发布 Release；
-# 也可在 Actions 页面手动触发
+# 推 master：跑单测 + 构建 Windows/Linux 包，产物挂在 Actions 运行页可直接下载，
+#   但**不发 Release** —— 正式版本仍然只由 tag 产生，避免 Releases 列表被开发构建淹没。
+# 推 tag（如 v5.3.0）：同上，外加发布 Release。
+# 也可在 Actions 页面手动触发。
 on:
   push:
+    branches:
+      - master
     tags:
       - 'v*'
   workflow_dispatch:
 
 permissions:
   contents: write
+
+# 连发多次提交时，同一 ref 上新的运行取消还在跑的旧构建，不叠加 Windows 构建；
+# 分组按 ref 区分，所以 tag 的正式发版不会被分支推送打断。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # ---------------- 先跑单测，红了我就不往下打包 ----------------
