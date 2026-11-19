@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-floating_window.py — Stock Monitor 桌面悬浮窗 v5.3.0
+floating_window.py — Stock Monitor 桌面悬浮窗 v5.5.0
 PySide6 原生 Win11 风格悬浮窗：无边框、置顶、半透明、可拖拽
 数据获取复用 price_alert.py（A股）+ alpaca_*.py（美股 Alpaca 免费版）：
-  - A股：五路免费接口轮询（腾讯×2 / 新浪 / 东方财富×2）
+  - A股：八路免费接口轮询（腾讯×2 / 新浪 / 东方财富×2 / 华尔街见闻 / 同花顺 / 上交所官方）
   - 美股：实时=WebSocket 推送（alpaca_stream），历史K线/休市兜底=REST（alpaca_history）
 紧凑版：1/3 宽度，支持目标价 + 单日涨跌% 双预警
 """
@@ -43,6 +43,7 @@ from price_alert import (
     close_tdx_client, get_quotes_batch, get_kline_1min,
     configure_tdx_nodes, format_price, get_source_health,
     is_a_share_trading_time, is_bj_code, normalize_a_share_code,
+    search_stocks_by_name,
 )
 # 美股（Alpaca 免费版）：实时=WebSocket（alpaca_stream），历史/兜底=REST（alpaca_history）
 import alpaca_history
@@ -95,7 +96,7 @@ from PySide6.QtWidgets import (
 # ============================================================
 # 配置
 # ============================================================
-VERSION = "5.3.0"
+VERSION = "5.5.0"
 # 源码运行：项目内 scripts/watchlist_config.json
 # 打包 exe：exe 同级的 watchlist_config.json（用户可直接编辑，重启不丢）
 CONFIG_FILE = (
@@ -611,7 +612,7 @@ class QuoteWorker(QThread):
                            if item.get('code')
                            and (us_enabled or not is_us_symbol(item.get('code')))]
 
-            # 按市场分流：非美股走 A 股五路轮询，美股走 Alpaca（WS 缓存优先，REST 兜底）
+            # 按市场分流：非美股走 A 股八路轮询，美股走 Alpaca（WS 缓存优先，REST 兜底）
             # 美股按归一化代码请求（大写、剥掉 us 前缀），结果再映射回配置里的原样代码：
             # 否则手改/旧版配置的 'aapl'、'usAAPL' 永远查不到键，卡片会一直显示 '--'
             a_codes = [c for c in valid_codes if not is_us_symbol(c)]
@@ -1549,6 +1550,20 @@ class QuoteCard(QFrame):
 # ============================================================
 # 异步股票代码查询线程（避免网络请求阻塞UI）
 # ============================================================
+def _search_candidates_by_name(text):
+    """按名称/拼音反查候选：A 股走腾讯 smartbox，美股走 Alpaca assets（未启用时为空）"""
+    candidates = []
+    try:
+        candidates.extend(search_stocks_by_name(text))
+    except Exception:
+        pass
+    try:
+        candidates.extend(alpaca_history.search_symbols_by_name(text))
+    except Exception:
+        pass
+    return candidates
+
+
 class _StockResolveThread(QThread):
     """在后台线程查询股票代码，避免阻塞UI事件循环"""
     finished_resolve = Signal(list)  # 传递候选列表 [(code, name), ...]
@@ -1606,6 +1621,10 @@ class _StockResolveThread(QThread):
                         continue
                 if not candidates:
                     candidates = [('sh' + text, '')]
+
+            # 其余输入（中文名/拼音/英文名）按名称反查代码，多候选同样弹窗选择
+            else:
+                candidates = _search_candidates_by_name(text)
 
         except Exception as e:
             import traceback
@@ -1779,7 +1798,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(top_box)
 
         # 表格
-        table_label = QLabel('监控列表（双击编辑）')
+        table_label = QLabel('监控列表（双击编辑；填代码联想名称，代码为空时填名称联想代码）')
         table_label.setStyleSheet('font-weight: 600; font-size: 12px; margin-top: 4px;')
         layout.addWidget(table_label)
 
@@ -1955,37 +1974,43 @@ class SettingsDialog(QDialog):
                 return
 
     def _on_code_changed(self, row, col):
-        """代码单元格变化时,启动异步线程搜索名称(避免阻塞UI)"""
+        """代码列变化→解析名称；名称列输入（代码还为空）→反查代码"""
         if self._block_signals or getattr(self, '_loading', False):
             return
-        if col != 0:  # 只处理代码列
+        if col not in (0, 1):
             return
 
         item = self.table.item(row, col)
         if not item:
             return
-        code = item.text().strip()
-        if not code:
+        text = item.text().strip()
+        if not text:
             return
 
-        # 沪深代码（含大写/s_）统一归一再解析；北交所/港股不发起无意义请求。
-        canonical = normalize_a_share_code(code)
-        if canonical and canonical != code:
-            self._block_signals = True
-            item.setText(canonical)
-            self._block_signals = False
-            code = canonical
-        if is_bj_code(code) or code.lower().startswith('hk'):
-            return
-
-        name_item = self.table.item(row, 1)
+        if col == 1:
+            # 只在代码为空时反查（新增股票场景）；已有代码说明是手动改名称，不打扰
+            code_item = self.table.item(row, 0)
+            if code_item is None or code_item.text().strip():
+                return
+            target_item, name_item = code_item, item
+        else:
+            # 沪深代码（含大写/s_）统一归一再解析；北交所/港股不发起无意义请求。
+            canonical = normalize_a_share_code(text)
+            if canonical and canonical != text:
+                self._block_signals = True
+                item.setText(canonical)
+                self._block_signals = False
+                text = canonical
+            if is_bj_code(text) or text.lower().startswith('hk'):
+                return
+            target_item, name_item = item, self.table.item(row, 1)
 
         # 回调必须绑定「发出信号的那个线程」：原先是从 self._resolve_thread 反查 item，
         # 旧线程已结束但排队中的回调会把候选写进新线程的行 —— 名称/代码错挂到别的股票。
         # 绑定后既不用 wait 阻塞界面，也不用担心误删引用（运行中的 QThread 被 GC 会 abort）。
-        th = _StockResolveThread(code)
+        th = _StockResolveThread(text)
         th._row = row
-        th._item = item
+        th._item = target_item
         th._name_item = name_item
         th.finished_resolve.connect(lambda cands, t=th: self._on_resolve_done(cands, t))
         self._resolve_thread = th
@@ -2303,7 +2328,7 @@ class FloatingWindow(QWidget):
         self.update_label.setStyleSheet(f'color: {get_color("text_dim")}; font-size: 9px;')
         h.addWidget(self.update_label)
 
-        # 数据源健康：5/5 表示五路 A 股源均可用；红/黄提示被临时屏蔽
+        # 数据源健康：8/8 表示八路 A 股源均可用；红/黄提示被临时屏蔽
         self.source_label = QLabel('源 --')
         self.source_label.setStyleSheet(
             f'color: {get_color("text_dim")}; font-size: 8px;'

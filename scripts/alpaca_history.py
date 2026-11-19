@@ -479,6 +479,28 @@ def get_symbol_name(symbol, refresh_hours=24):
         return _assets_cache.get(sym, '')
 
 
+def search_symbols_by_name(query, limit=20):
+    """按名称反查美股代码（不区分大小写子串匹配），返回 [(symbol, name), ...]。
+
+    未配置凭证时返回 []；assets 缓存懒加载口径与 get_symbol_name 一致。
+    名称前缀命中的排在前面，其余按代码排序，最多返回 limit 条。
+    """
+    q = (query or '').strip().lower()
+    if not q or not has_credentials():
+        return []
+    with _assets_lock:
+        need_load = (not _assets_loaded) or (time.time() - _assets_ts > 24 * 3600)
+    if need_load:
+        try:
+            _load_assets()
+        except Exception as e:
+            print(f'[Alpaca] 加载股票名称失败: {e}')
+    with _assets_lock:
+        matches = [(sym, nm) for sym, nm in _assets_cache.items() if q in nm.lower()]
+    matches.sort(key=lambda item: (not item[1].lower().startswith(q), item[0]))
+    return matches[:limit]
+
+
 # ============================================================
 # 历史 K 线（悬浮图数据源）
 # ============================================================

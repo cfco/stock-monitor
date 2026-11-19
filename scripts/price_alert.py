@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-price_alert.py — A股价格预警监控脚本 v5.3.0
+price_alert.py — A股价格预警监控脚本 v5.5.0
 用法示例:
   python price_alert.py --code sh601868 --target 2.90 --dir below
   python price_alert.py --code sz000560 --target 2.60 --dir above --interval 15
@@ -34,6 +34,7 @@ import time
 import datetime
 import subprocess
 import threading
+import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 
@@ -285,14 +286,25 @@ def _source_recover(name):
         SOURCE_FAIL_COUNTS[name] = 0
 
 
-A_SHARE_SOURCES = ('tencent', 'sina', 'eastmoney', 'tencent_sqt', 'eastmoney_his')
+A_SHARE_SOURCES = ('tencent', 'sina', 'eastmoney', 'tencent_sqt', 'eastmoney_his',
+                   'wscn', '10jqka', 'sse')
 SOURCE_DISPLAY_NAMES = {
     'tencent': '腾讯',
     'sina': '新浪',
     'eastmoney': '东方财富',
     'tencent_sqt': '腾讯备用',
     'eastmoney_his': '东财历史',
+    'wscn': '华尔街见闻',
+    '10jqka': '同花顺',
+    'sse': '上交所官方',
 }
+
+
+def _source_coverable_codes(name, codes):
+    """该源能覆盖的请求代码：上交所官方仅沪市，其余沪深都覆盖。"""
+    if name == 'sse':
+        return [c for c in codes if c.startswith('sh')]
+    return list(codes)
 
 
 def get_source_health():
@@ -625,6 +637,37 @@ def get_quote_tencent(code):
         raise ValueError(f'腾讯返回字段残缺或价格无效: {canonical}')
     quote['code'] = canonical
     return quote
+
+
+def search_stocks_by_name(query):
+    """按名称/拼音模糊搜索沪深股票（腾讯 smartbox），返回 [(code, name), ...]。
+
+    只保留 sh/sz 候选：北交所/港股本版本不支持，美股名称反查走 Alpaca assets。
+    网络/格式异常向上抛，由调用方降级。
+    """
+    q = str(query or '').strip()
+    if not q:
+        return []
+    url = 'https://smartbox.gtimg.cn/s3/?v=2&t=all&q=' + urllib.parse.quote(q)
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with _HTTP_OPENER.open(req, timeout=5) as resp:
+        content = resp.read().decode('gbk', errors='replace')
+    m = re.search(r'v_hint="([^"]*)"', content)
+    if not m:
+        return []
+    candidates = []
+    for entry in m.group(1).split('^'):
+        fields = entry.split('~')
+        if len(fields) < 3:
+            continue
+        market, num, name = fields[0], fields[1], fields[2]
+        if market not in ('sh', 'sz') or not re.fullmatch(r'\d{6}', num):
+            continue
+        # v=2 接口把中文写成 \uXXXX 字面量，这里还原成真实名称
+        name = re.sub(r'\\u([0-9a-fA-F]{4})',
+                      lambda mm: chr(int(mm.group(1), 16)), name)
+        candidates.append((market + num, name))
+    return candidates
 
 
 def detect_market(code):
@@ -1018,6 +1061,214 @@ def get_quotes_eastmoney_batch(codes):
     return results
 
 
+def _finite_float(val):
+    """只接受有限数的浮点转换；坏值（None/'-'/空串/NaN/inf）一律 None。"""
+    if val is None or val == '-' or val == '':
+        return None
+    try:
+        v = float(val)
+    except (ValueError, TypeError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def get_quotes_wscn_batch(codes):
+    """华尔街见闻批量行情（JSON，无鉴权，沪深都覆盖）。
+
+    字段按 data.fields 名字对齐取值（接口会丢弃不支持的字段名，顺序不保证）；
+    不提供昨收，由现价与涨跌幅反推（px_change_rate 单位是百分数）。
+    """
+    normalized = []
+    for code in codes:
+        canonical = normalize_a_share_code(code)
+        if canonical and canonical not in normalized:
+            normalized.append(canonical)
+    if not normalized:
+        return {}
+    prod_by_code = {c[2:] + ('.SS' if c.startswith('sh') else '.SZ'): c
+                    for c in normalized}
+    url = ('https://api-ddc-wscn.awtmt.com/market/real?prod_code='
+           + ','.join(prod_by_code)
+           + '&fields=prod_name,last_px,open_px,high_px,low_px,px_change_rate,update_time')
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    try:
+        with _HTTP_OPENER.open(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+    except Exception as e:
+        print(f'[WSCN Batch] failed: {e}')
+        return {}
+    payload = (data or {}).get('data') or {}
+    fields = payload.get('fields') or []
+    snapshot = payload.get('snapshot') or {}
+    idx = {f: i for i, f in enumerate(fields)}
+    if 'last_px' not in idx:
+        return {}
+
+    def _num(row, name):
+        i = idx.get(name)
+        if i is None or i >= len(row):
+            return None
+        return _finite_float(row[i])
+
+    results = {}
+    for prod, code in prod_by_code.items():
+        row = snapshot.get(prod)
+        if not isinstance(row, list):
+            continue
+        price = _num(row, 'last_px')
+        if price is None or price <= 0:
+            continue
+        pct = _num(row, 'px_change_rate')
+        yest = price / (1 + pct / 100) if pct is not None and pct > -100 else None
+        high, low = _num(row, 'high_px'), _num(row, 'low_px')
+        if (high is None or high <= 0) and price > 0:
+            high = price
+        if (low is None or low <= 0) and price > 0:
+            low = price
+        name_i = idx.get('prod_name')
+        name = row[name_i] if name_i is not None and name_i < len(row) else code
+        results[code] = {
+            'name': name,
+            'code': code,
+            'price': price,
+            'yest_close': yest,
+            'open': _num(row, 'open_px'),
+            'high': high,
+            'low': low,
+            'change_pct': pct,
+        }
+    return results
+
+
+def get_quote_10jqka(code):
+    """同花顺 realhead 单票实时（数字键映射，无需 Referer）。
+
+    键映射（盘中对腾讯基准核验）：6=昨收 7=今开 8=最高 9=最低 10=最新
+    24=买1价 30=卖1价；name 实测在 items 内（部分节点/时段顶层也有，两处都认）。
+    盘前最新价可能为 0，用买1/卖1兜底（与新浪同口径）。
+    """
+    canonical = require_a_share_code(code)
+    url = f'http://d.10jqka.com.cn/v2/realhead/hs_{canonical[2:]}/last.js'
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with _HTTP_OPENER.open(req, timeout=3) as resp:
+        body = resp.read().decode('utf-8', errors='replace')
+    start, end = body.find('('), body.rfind(')')
+    if start < 0 or end <= start:
+        raise ValueError(f'同花顺返回格式异常: {canonical}')
+    obj = json.loads(body[start + 1:end]) or {}
+    items = obj.get('items') or {}
+    price = _finite_float(items.get('10'))
+    if price is None or price <= 0:
+        price = _finite_float(items.get('24'))
+    if price is None or price <= 0:
+        price = _finite_float(items.get('30'))
+    yest = _finite_float(items.get('6'))
+    high, low = _finite_float(items.get('8')), _finite_float(items.get('9'))
+    if (high is None or high <= 0) and price and price > 0:
+        high = price
+    if (low is None or low <= 0) and price and price > 0:
+        low = price
+    change_pct = None
+    if price is not None and yest and yest > 0:
+        change_pct = (price - yest) / yest * 100
+    return {
+        'name': obj.get('name') or items.get('name') or canonical,
+        'code': canonical,
+        'price': price,
+        'yest_close': yest,
+        'open': _finite_float(items.get('7')),
+        'high': high,
+        'low': low,
+        'change_pct': change_pct,
+    }
+
+
+def get_quotes_10jqka_batch(codes):
+    """同花顺批量适配器：单票端点循环（沪深都覆盖）。
+
+    连续 2 只异常即停（节点大概率挂了），剩下的交给轮询层的腾讯补齐，
+    避免 N 只 × 3s 超时把整轮轮询拖死。
+    """
+    results = {}
+    consecutive_errors = 0
+    for code in dict.fromkeys(normalize_a_share_code(c) for c in codes):
+        if not code:
+            continue
+        try:
+            quote = get_quote_10jqka(code)
+            if _is_usable_quote(quote):
+                results[code] = quote
+            consecutive_errors = 0
+        except Exception as e:
+            print(f'[10jqka Batch] {code}: {e}')
+            consecutive_errors += 1
+            if consecutive_errors >= 2:
+                break
+    return results
+
+
+def get_quote_sse(code):
+    """上交所官方快照（yunhq，仅沪市，交易所一手源）。
+
+    snap 顺序（盘中对腾讯基准核验）：0=名称 1=昨收 2=今开 3=最高 4=最低
+    5=最新 6=涨跌额 7=涨跌幅 8=量 9=额，其后为五档盘口。
+    """
+    canonical = require_a_share_code(code)
+    if not canonical.startswith('sh'):
+        raise ValueError(f'上交所官方源仅支持沪市: {canonical}')
+    url = f'http://yunhq.sse.com.cn:32041/v1/sh1/snap/{canonical[2:]}'
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with _HTTP_OPENER.open(req, timeout=3) as resp:
+        data = json.loads(resp.read().decode('utf-8'))
+    snap = (data or {}).get('snap') or []
+    if len(snap) < 6:
+        raise ValueError(f'上交所返回字段残缺: {canonical}')
+    price = _finite_float(snap[5])
+    yest = _finite_float(snap[1])
+    high, low = _finite_float(snap[3]), _finite_float(snap[4])
+    if (high is None or high <= 0) and price and price > 0:
+        high = price
+    if (low is None or low <= 0) and price and price > 0:
+        low = price
+    change_pct = None
+    if price is not None and yest and yest > 0:
+        change_pct = (price - yest) / yest * 100
+    return {
+        'name': snap[0] or canonical,
+        'code': canonical,
+        'price': price,
+        'yest_close': yest,
+        'open': _finite_float(snap[2]),
+        'high': high,
+        'low': low,
+        'change_pct': change_pct,
+    }
+
+
+def get_quotes_sse_batch(codes):
+    """上交所官方批量适配器：只取沪市代码。
+
+    深市天然不覆盖——轮询层按覆盖范围把本排除（或只判沪市子集），
+    不把「覆盖不到」当成「查询失败」去累计熔断计数。
+    """
+    results = {}
+    consecutive_errors = 0
+    for code in dict.fromkeys(normalize_a_share_code(c) for c in codes):
+        if not code or not code.startswith('sh'):
+            continue
+        try:
+            quote = get_quote_sse(code)
+            if _is_usable_quote(quote):
+                results[code] = quote
+            consecutive_errors = 0
+        except Exception as e:
+            print(f'[SSE Batch] {code}: {e}')
+            consecutive_errors += 1
+            if consecutive_errors >= 2:
+                break
+    return results
+
+
 def _map_results_to_input(results, original_by_canonical):
     """把数据层规范代码键映射回用户配置里的原始写法（如 SH601398）。"""
     mapped = {}
@@ -1066,39 +1317,49 @@ def get_quotes_batch(codes, source='auto', host=None):
                 print(f'[TDX Batch] Error for {code}: {e}')
         return _map_results_to_input(results, original_by_canonical)
 
-    # A股：五源轮询（腾讯主/新浪/东方财富行情/腾讯备用/东方财富历史），避免单一接口限流
+    # A股：八源轮询（腾讯/新浪/东财行情/腾讯备用/东财历史/华尔街见闻/同花顺/上交所官方），
+    # 避免单一接口限流；连续 5 次失败的源屏蔽 300 秒（见 _source_mark_fail）
     source_funcs = {
         'tencent':        get_quotes_tencent_batch,
         'sina':           get_quotes_sina_batch,
         'eastmoney':      get_quotes_eastmoney_batch,
         'tencent_sqt':    get_quotes_tencent_sqt_batch,
         'eastmoney_his':  get_quotes_eastmoney_his_batch,
+        'wscn':           get_quotes_wscn_batch,
+        '10jqka':         get_quotes_10jqka_batch,
+        'sse':            get_quotes_sse_batch,
     }
-    # 过滤已屏蔽的接口，优先使用可用源
-    available_sources = [s for s in A_SHARE_SOURCES if _source_available(s)]
+    # 过滤已屏蔽的接口；覆盖不到任何请求代码的源（如纯深市列表遇上上交所官方）
+    # 本轮直接排除，不算失败
+    available_sources = [s for s in A_SHARE_SOURCES
+                         if _source_available(s) and _source_coverable_codes(s, canonical_codes)]
     if not available_sources:
         # 极端情况：所有源都被屏蔽了，还是退化为全量轮询避免死锁
-        available_sources = list(A_SHARE_SOURCES)
+        available_sources = [s for s in A_SHARE_SOURCES
+                             if _source_coverable_codes(s, canonical_codes)] or list(A_SHARE_SOURCES)
     global _a_share_cursor
     with _a_share_cursor_lock:
         idx = _a_share_cursor
         _a_share_cursor = (idx + 1) % len(available_sources)
     cur_source = available_sources[idx % len(available_sources)]
 
+    coverage = _source_coverable_codes(cur_source, canonical_codes)
+
     batch_results = {}
     func = source_funcs[cur_source]
     try:
-        batch_results = func(canonical_codes)
+        batch_results = func(coverage)
     except Exception as e:
         print(f'[Source] {cur_source} 调用异常: {e}')
         batch_results = {}
 
     # 坏数据（None/0/负价/NaN）不参与源健康判定，也不允许上屏。
     batch_results = _filter_valid_quotes(batch_results)
-    if _batch_has_valid_result(batch_results, canonical_codes):
+    # 健康判定只对该源能覆盖的子集：上交所官方拿不到深市不是它的失败
+    if _batch_has_valid_result(batch_results, coverage):
         _source_mark_success(cur_source)
     else:
-        _source_mark_fail(cur_source, f'(结果: {len(batch_results)}/{len(canonical_codes)})')
+        _source_mark_fail(cur_source, f'(结果: {len(batch_results)}/{len(coverage)})')
 
     # 当前源获取不全的，优先用腾讯补充（腾讯作为兜底基准）
     missing = [c for c in canonical_codes if c not in batch_results]
@@ -1297,7 +1558,7 @@ def check_single(code, name, target, direction, interval, log_file,
     """监控单只股票"""
     source_label = f'TDX({host or DEFAULT_TDX_HOST})' if source == 'tdx' else 'Tencent'
     print(f'========================================')
-    print(f'  PRICE ALERT MONITOR v5.3.0')
+    print(f'  PRICE ALERT MONITOR v5.5.0')
     print(f'  {name} ({code})')
     if direction == 'below':
         print(f'  Condition: price <= {target}')
@@ -1419,7 +1680,7 @@ def check_multi(config_file, source='tdx', host=None, notify='popup'):
 
     source_label = f'TDX({host or DEFAULT_TDX_HOST})' if source == 'tdx' else 'Tencent'
     print(f'========================================')
-    print(f'  MULTI-STOCK PRICE ALERT MONITOR v5.3.0')
+    print(f'  MULTI-STOCK PRICE ALERT MONITOR v5.5.0')
     print(f'  Monitoring {len(items)} stock(s)')
     print(f'  Source: {source_label} | Interval: {interval}s')
     print(f'  Started: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
@@ -1499,7 +1760,7 @@ def main():
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
     parser = argparse.ArgumentParser(
-        description='A股价格预警监控 v5.3.0（通达信协议/腾讯接口双源）',
+        description='A股价格预警监控 v5.5.0（通达信协议/腾讯接口双源）',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:

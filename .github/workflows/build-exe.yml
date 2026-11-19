@@ -2,7 +2,7 @@ name: Build Releases
 
 # 发布策略（按仓库可见性分流，不是账号级设置 —— GitHub 没有"公开仓自动发 Release"
 # 这种全局开关，规则只能写在本文件里）：
-#   公开仓：推 master 每次新建一条**预发布** Release（tag 形如 v5.3.0-dev.42），
+#   公开仓：推 master 每次新建一条**预发布** Release（tag 形如 v5.5.0-dev.42），
 #           推 tag 发正式 Release，手动触发也发。
 #   私有仓：只有推 tag 或手动 workflow_dispatch 才发 Release；推 master 只构建、
 #           产物留在 Actions 运行页。
