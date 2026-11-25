@@ -12,9 +12,9 @@ secret_store.py — 本地凭证加密存储（Windows DPAPI）
     在别的机器/别的用户下也无法解密，泄露风险大幅降低
   - 换机器迁移配置后凭证不可解密属预期行为（重新输入一次即可）
 
-非 Windows 平台（Ubuntu 等）DPAPI 不存在：
-  降级为 base64 编码保存（明文等价），启动时会打印一次提示。
-  本项目主部署环境是 Windows 11，降级路径仅为不让程序在 Linux 上崩溃。
+非 Windows 平台（Linux/macOS）不提供 DPAPI：
+  拒绝持久化并抛出 SecretStoreError，绝不以 base64 明文等价充当加密。
+  启动迁移时会移除无法安全保存的凭证字段，调用方必须明确提示用户。
 
 配置迁移（migrate_config）：
   旧格式 alpaca.{api_key, secret}（明文）→ 加密写入 alpaca.{api_key_enc, secret_enc}
@@ -31,7 +31,16 @@ import sys
 # 应用专属熵（optional entropy）：同一 Windows 用户下，其它程序拿到密文也无法解
 _ENTROPY = b'stock-monitor/alpaca-credentials/v1'
 _IS_WINDOWS = (sys.platform == 'win32')
-_non_windows_warned = False
+
+
+class SecretStoreError(RuntimeError):
+    """当前平台无法安全持久化凭证。"""
+
+
+def _require_secure_storage():
+    if not _IS_WINDOWS:
+        raise SecretStoreError(
+            '当前 Linux/macOS 平台不支持安全凭证持久化；已拒绝保存，请使用 Windows。')
 
 
 class _DATA_BLOB(ctypes.Structure):
@@ -57,6 +66,7 @@ def encrypt(plain):
     """明文字符串 → base64 密文字符串；空输入原样返回 ''"""
     if not plain:
         return ''
+    _require_secure_storage()
     data = plain.encode('utf-8')
     if _IS_WINDOWS:
         in_blob, in_buf = _make_blob(data)          # in_buf 保引用防 GC
@@ -74,13 +84,6 @@ def encrypt(plain):
         finally:
             _free_blob(out_blob)
         return base64.b64encode(raw).decode('ascii')
-
-    # 非 Windows 降级：base64（非加密，仅保证可运行）。首次使用时提示一次。
-    global _non_windows_warned
-    if not _non_windows_warned:
-        print('[SecretStore] 非 Windows 平台：DPAPI 不可用，凭证将以 base64 明文等价保存')
-        _non_windows_warned = True
-    return base64.b64encode(data).decode('ascii')
 
 
 def decrypt(cipher_b64):
@@ -108,11 +111,9 @@ def decrypt(cipher_b64):
         finally:
             _free_blob(out_blob)
 
-    # 非 Windows 降级读取
-    try:
-        return raw.decode('utf-8')
-    except Exception:
-        return ''
+    # 非 Windows 不把旧 base64 字段当作安全密文读取。
+    print('[SecretStore] 非 Windows 平台忽略 api_key_enc/secret_enc：旧 base64 不是安全加密')
+    return ''
 
 
 def load_alpaca_creds(alc):
@@ -121,6 +122,9 @@ def load_alpaca_creds(alc):
     优先读 _enc 密文字段；若只有旧明文字段（迁移前）也兼容返回，
     但正常流程下 migrate_config 已在启动时把明文清掉了。
     """
+    if not _IS_WINDOWS:
+        print('[SecretStore] 非 Windows 平台忽略配置中的凭证字段，拒绝明文等价读取')
+        return '', ''
     key = decrypt(alc.get('api_key_enc') or '')
     secret = decrypt(alc.get('secret_enc') or '')
     if not key:
@@ -131,15 +135,20 @@ def load_alpaca_creds(alc):
 
 
 def store_alpaca_creds(alc, api_key, secret):
-    """加密写入凭证到 alpaca 配置段（就地修改 dict），并确保无明文残留"""
-    alc['api_key_enc'] = encrypt(api_key or '')
-    alc['secret_enc'] = encrypt(secret or '')
+    """加密写入凭证到 alpaca 配置段（就地修改 dict），并确保无明文残留。
+
+    非 Windows 会抛 SecretStoreError；先完成两次加密再改 dict，失败时原配置不变。
+    """
+    key_enc = encrypt(api_key or '')
+    secret_enc = encrypt(secret or '')
+    alc['api_key_enc'] = key_enc
+    alc['secret_enc'] = secret_enc
     alc.pop('api_key', None)
     alc.pop('secret', None)
 
 
 def migrate_config(config):
-    """把配置里的旧明文凭证迁移为 DPAPI 密文。
+    """把配置里的旧明文凭证迁移为安全密文。
 
     返回 True 表示发生了变更（调用方应落盘保存）；False 表示无需迁移。
     幂等：重复调用不会重复加密（明文字段已被删除时直接跳过）。
@@ -147,19 +156,30 @@ def migrate_config(config):
     alc = (config or {}).get('alpaca')
     if not isinstance(alc, dict):
         return False
+    if not _IS_WINDOWS:
+        fields = ('api_key', 'secret', 'api_key_enc', 'secret_enc')
+        removed = [field for field in fields if field in alc]
+        for field in removed:
+            alc.pop(field, None)
+        if removed:
+            print('[SecretStore] 非 Windows 平台已移除无法安全保存的凭证字段')
+        return bool(removed)
     changed = False
+    encrypted = {}
     for plain_field, enc_field in (('api_key', 'api_key_enc'), ('secret', 'secret_enc')):
         plain = alc.get(plain_field)
         if plain:                                   # 有明文残留才迁移
             try:
-                alc[enc_field] = encrypt(plain)
+                encrypted[plain_field] = (enc_field, encrypt(plain))
             except Exception as e:
                 print(f'[SecretStore] {plain_field} 加密迁移失败: {e}（保留原字段，下次重试）')
-                continue
-            del alc[plain_field]                    # 迁移成功即删除明文
+    if len(encrypted) == sum(bool(alc.get(field)) for field in ('api_key', 'secret')):
+        for plain_field, (enc_field, cipher) in encrypted.items():
+            alc[enc_field] = cipher
+            del alc[plain_field]
             changed = True
     if changed:
-        print('[SecretStore] 已将明文凭证迁移为 DPAPI 密文')
+        print('[SecretStore] 已将明文凭证迁移为安全密文')
     return changed
 
 

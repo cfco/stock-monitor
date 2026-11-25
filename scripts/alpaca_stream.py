@@ -16,6 +16,7 @@ alpaca_stream.py — Alpaca 美股实时行情（WebSocket，免费版 IEX 口�
   - 连接代理：走本地 127.0.0.1:7890（直连访问不到 Alpaca，与 REST 口径一致）
 """
 
+import datetime
 import json
 import threading
 import time
@@ -29,13 +30,16 @@ STREAM_STALE = 300          # stream 缓存超过 5 分钟视为过期，改走 
 RETRY_BASE = 5              # 重连退避起步秒数
 RETRY_MAX = 60              # 重连退避封顶秒数
 POLL_INTERVAL = 15          # 非数据窗口下的轮询间隔（秒）
+CONNECT_TIMEOUT = 5         # TCP/代理/TLS/WebSocket 握手各阶段的 socket 超时（秒）
+CLOSE_TIMEOUT = 3           # 主动关闭时等待 close frame 的上限（秒）
+CLOCK_SKEW = 5              # 行情事件时间允许略超前本地时钟的秒数
 
 
 # ============================================================
 # 模块级实时缓存（工作线程写、行情线程读，加锁保护）
 # ============================================================
 _quotes_lock = threading.Lock()
-_quotes = {}                # {symbol: {'price','ts','quote_t'}}
+_quotes = {}                # {symbol: {'price','ts','quote_t'}}，ts 为行情事件时间
 
 # 昨收补拉：REST 绝不能发生在 on_message 里 —— 收流线程被阻塞期间不读 socket，
 # ping_timeout 会把它误判成断线，进而引发重连风暴（且 force 绕开 TTL 更费配额）。
@@ -82,15 +86,25 @@ def _prev_fetch_loop():
 
 
 def _update_quote(symbol, price, quote_t=None):
-    """写入一条实时价（trade 或 quote 触发）"""
+    """按行情事件时间写入实时价；旧事件/补发不能刷新新鲜期。"""
     if price is None or price <= 0:
+        return
+    event_time = alpaca_history._parse_iso(quote_t)
+    if event_time is None:
+        return
+    if event_time.tzinfo is None:
+        event_time = event_time.replace(tzinfo=datetime.timezone.utc)
+    event_ts = event_time.timestamp()
+    now = time.time()
+    if event_ts > now + CLOCK_SKEW:
         return
     with _quotes_lock:
         entry = _quotes.setdefault(symbol, {'price': None, 'ts': 0.0, 'quote_t': None})
+        if event_ts < entry['ts']:
+            return
         entry['price'] = float(price)
-        entry['ts'] = time.time()
-        if quote_t:
-            entry['quote_t'] = quote_t
+        entry['ts'] = event_ts
+        entry['quote_t'] = quote_t
 
 
 def _read_quote(symbol):
@@ -120,7 +134,7 @@ def get_quotes_batch(codes):
     for code in codes:
         entry = _read_quote(code)
         if entry and entry.get('price') and now - entry['ts'] < STREAM_STALE:
-            results[code] = _build_quote(code, entry['price'])
+            results[code] = _build_quote(code, entry['price'], entry['ts'])
         else:
             missing.append(code)
 
@@ -134,22 +148,39 @@ def get_quotes_batch(codes):
                     'price': snap.get('price'),
                     'yest_close': snap.get('yest_close'),
                     'change_pct': snap.get('change_pct'),
+                    'stale': bool(snap.get('stale')),
+                    'quote_ts': snap.get('quote_ts'),
                 }
     return results
 
 
-def _build_quote(symbol, price):
+def _build_quote(symbol, price, quote_ts=None):
     """stream 价 + 昨收 → 与 A 股一致的 quote 结构"""
     prev = alpaca_history.get_prev_close(symbol)
     change_pct = None
     if prev:
         change_pct = round((price - prev) / prev * 100, 2)
-    return {'price': price, 'yest_close': prev, 'change_pct': change_pct}
+    return {'price': price, 'yest_close': prev, 'change_pct': change_pct,
+            'quote_ts': quote_ts}
 
 
 # ============================================================
 # WebSocket 工作线程
 # ============================================================
+def _credential_snapshot():
+    with alpaca_history._creds_lock:
+        creds = alpaca_history._creds
+        return creds['key'], creds['secret']
+
+
+def _close_websocket(ws):
+    if ws:
+        try:
+            ws.close(timeout=CLOSE_TIMEOUT)
+        except Exception:
+            pass
+
+
 class _AlpacaStreamThread(threading.Thread):
     """后台线程：窗口判定 → 连接 → 认证 → 订阅 → 收消息 → 断线退避重连"""
 
@@ -160,6 +191,9 @@ class _AlpacaStreamThread(threading.Thread):
         self._symbols_lock = threading.Lock()
         self._ws = None
         self._authed = False          # 本次连接是否已完成认证（决定何时发订阅）
+        self._session_error = False   # 认证后异常断线不能重置退避
+        self._credentials = _credential_snapshot()
+        self._generation = 0          # symbols/凭证变更时使正在握手的连接失效
         self.stopping = False         # 已被要求停止（生命周期管理据此判断能否复用）
 
     # ---------- 控制接口 ----------
@@ -169,23 +203,25 @@ class _AlpacaStreamThread(threading.Thread):
         with self._symbols_lock:
             changed = symbols != self._symbols
             self._symbols = list(symbols)
+            if changed:
+                self._generation += 1
         if changed:
-            ws = self._ws
-            if ws:
-                try:
-                    ws.close()        # 关闭后主循环会带着新 symbols 重连
-                except Exception:
-                    pass
+            _close_websocket(self._ws)
+
+    def credentials_changed(self):
+        """凭证变化时废弃当前连接，即使订阅列表相同也重新认证。"""
+        credentials = _credential_snapshot()
+        with self._symbols_lock:
+            if credentials == self._credentials:
+                return
+            self._credentials = credentials
+            self._generation += 1
+        _close_websocket(self._ws)
 
     def stop(self):
         self.stopping = True
         self._stop_event.set()
-        ws = self._ws
-        if ws:
-            try:
-                ws.close()
-            except Exception:
-                pass
+        _close_websocket(self._ws)
 
     def _get_symbols(self):
         with self._symbols_lock:
@@ -223,17 +259,30 @@ class _AlpacaStreamThread(threading.Thread):
     def _run_once(self, symbols):
         """单次连接的完整生命周期（阻塞到断开）；返回本轮是否认证成功过"""
         self._authed = False
+        self._session_error = False
         if self._stop_event.is_set():
             return False
+        credentials = _credential_snapshot()
+        previous_timeout = websocket.getdefaulttimeout()
+        with self._symbols_lock:
+            self._credentials = credentials
+            generation = self._generation
 
         def _close_if_stopping(ws):
             if self._stop_event.is_set():
-                try:
-                    ws.close()      # 握手已完成但已被要求停止：主动关掉，别留僵尸连接
-                except Exception:
-                    pass
+                _close_websocket(ws)
 
         def on_open(ws):
+            # 握手期间 symbols/凭证又变过 → 不认证旧连接，交给下一轮重建。
+            with self._symbols_lock:
+                obsolete = generation != self._generation
+            if self._stop_event.is_set() or obsolete:
+                websocket.setdefaulttimeout(previous_timeout)
+                _close_websocket(ws)
+                return
+            websocket.setdefaulttimeout(previous_timeout)   # 握手已完成，恢复进程默认值
+            if getattr(ws, 'sock', None) is not None:
+                ws.sock.settimeout(previous_timeout)       # 已连接的 socket 也不能沿用握手超时
             # 认证帧：凭证只进网络包，不打印日志
             with alpaca_history._creds_lock:
                 key, secret = alpaca_history._creds['key'], alpaca_history._creds['secret']
@@ -252,32 +301,46 @@ class _AlpacaStreamThread(threading.Thread):
 
         def on_error(ws, error):
             # 非正常关闭的错误都会走到这里，主循环负责退避重连
+            self._session_error = True
             print(f'[Alpaca WS] 错误: {error}')
 
         def on_close(ws, close_status, close_msg):
-            self._authed = False
+            # 正常断线仍保留「本轮认证过」供 run() 重置退避；停止或异常码不重置。
+            if self._stop_event.is_set() or close_status not in (1000, 1001):
+                self._authed = False
 
-        self._ws = websocket.WebSocketApp(
-            STREAM_URL,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close,
-        )
+        # run_forever 没有握手 timeout 参数；其 connect 路径使用进程默认 socket
+        # timeout。生命周期保证只有一条 Alpaca 流，故仅在握手窗口覆盖该默认值。
+        websocket.setdefaulttimeout(CONNECT_TIMEOUT)
         try:
-            # 走本地代理 127.0.0.1:7890（直连访问不到 Alpaca，与 REST 口径一致）
-            # proxy_type 必须显式给：websocket-client 1.9.x 缺省传入 None 会触发
-            # "Only http, socks4, socks5 proxy protocols are supported" 异常
+            if self._stop_event.is_set():
+                return False
+            self._ws = websocket.WebSocketApp(
+                STREAM_URL,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            if generation != self._generation or credentials != _credential_snapshot():
+                return False
             self._ws.run_forever(
                 ping_interval=20, ping_timeout=10,
                 http_proxy_host=alpaca_history.PROXY_HOST,
                 http_proxy_port=alpaca_history.PROXY_PORT,
+                http_proxy_timeout=CONNECT_TIMEOUT,
                 proxy_type='http',
             )
         finally:
-            authed = self._authed
+            websocket.setdefaulttimeout(previous_timeout)
+            authed = self._authed and not self._session_error
+            ws = self._ws
             self._ws = None
             self._authed = False
+            self._session_error = False
+            if self._stop_event.is_set():
+                authed = False
+            _close_websocket(ws)
         return authed
 
     # ---------- 消息处理 ----------
@@ -350,7 +413,7 @@ class _AlpacaStreamThread(threading.Thread):
 # 生命周期管理（由 floating_window 调用）
 # ============================================================
 _thread = None
-_thread_lock = threading.Lock()
+_thread_lock = threading.RLock()   # handoff 持有锁完成最新列表启动，避免旧 symbols 回写
 _pending_symbols = []       # 最近一次要求的订阅列表（交接手线程用最新的）
 
 
@@ -368,8 +431,15 @@ def ensure_started(symbols):
                 _thread.set_symbols(symbols)
             return          # 正在收尾的线程由 handoff 用最新列表接手，这里不叠第二条连接
         _thread = _AlpacaStreamThread()
-        _thread.start()
         _thread.set_symbols(symbols)
+        _thread.start()
+
+
+def credentials_changed():
+    """alpaca_history.configure 后调用；订阅不变也会强制重新认证。"""
+    with _thread_lock:
+        if _thread is not None and _thread.is_alive() and not _thread.stopping:
+            _thread.credentials_changed()
 
 
 def stop():
@@ -403,18 +473,22 @@ def _stop_locked():
 
 
 def _handoff(old):
+    """持续等待旧线程退出，再用最新 _pending_symbols 接手；超时不放弃恢复。"""
     global _thread
-    old.join(timeout=60)
-    if old.is_alive():
-        print('[Alpaca WS] 旧流线程 60 秒仍未退出，放弃接手（行情由 REST 兜底）')
-        return
+    while old.is_alive():
+        old.join(timeout=CONNECT_TIMEOUT + CLOSE_TIMEOUT + 2)
+        if old.is_alive():
+            with _thread_lock:
+                if _thread is not old:
+                    return
+            print('[Alpaca WS] 旧流线程仍未退出，继续等待后接手（不叠第二条连接）')
     with _thread_lock:
         if _thread is not old:
             return                  # 期间已被别的调用重建
         _thread = None
-        symbols = list(_pending_symbols)
-    if symbols:
-        ensure_started(symbols)
+        # RLock 内完成读取与启动，ensure_started 的更新要么在前、要么在后，
+        # 交接线程不能用释放锁前读到的旧 symbols 覆盖新列表。
+        ensure_started(_pending_symbols)
 
 
 def is_running():

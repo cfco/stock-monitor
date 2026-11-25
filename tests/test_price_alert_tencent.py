@@ -88,7 +88,9 @@ def patch_http(monkeypatch):
 def test_single_quote(patch_http):
     payload = _single_payload('sh601398', name='工商银行', price=6.12, yest=6.00,
                               opn=6.01, chg=2.0, high=6.20, low=5.95)
-    patch_http(payload)
+    fields = payload.split('"')[1].split('~')
+    fields[30], fields[31] = '20261104', '093000'
+    patch_http('v_sh601398="' + '~'.join(fields) + '";')
     q = price_alert.get_quote_tencent('sh601398')
     assert q['code'] == 'sh601398'
     assert q['name'] == '工商银行'
@@ -98,6 +100,7 @@ def test_single_quote(patch_http):
     assert q['change_pct'] == 2.0
     assert q['high'] == 6.20
     assert q['low'] == 5.95
+    assert q['quote_ts'] == price_alert._cn_timestamp('20261104', '093000')
 
 
 def test_batch_quote(patch_http):

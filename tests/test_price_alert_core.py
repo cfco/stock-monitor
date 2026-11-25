@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import threading
 
 import pytest
@@ -81,3 +82,69 @@ def test_batch_usable_requires_change_pct():
     # 缺 change_pct 不算有效（涨跌幅预警依赖它）
     assert price_alert._batch_has_valid_result({'a': {'price': 1.0}}, codes) is False
     assert price_alert._batch_has_valid_result({'a': {'price': 0}}, codes) is False
+
+
+def test_quote_timestamp_and_explicit_stale_marker(monkeypatch):
+    now = 2_000_000_000.0
+    monkeypatch.setattr(price_alert.time, 'time', lambda: now)
+    assert price_alert.quote_is_stale({'quote_ts': now - 10}) is False
+    assert price_alert.quote_is_stale({'quote_ts': now - 91}) is True
+    assert price_alert.quote_is_stale({'quote_ts': now + 61}) is True
+    assert price_alert.quote_is_stale({'stale': True}) is True
+    assert price_alert.quote_is_stale({'price': 10.0}) is False
+
+
+def test_powershell_fallback_does_not_interpolate_message(monkeypatch):
+    import ctypes
+    from types import SimpleNamespace
+    calls = []
+    monkeypatch.setattr(
+        ctypes, 'windll',
+        SimpleNamespace(user32=SimpleNamespace(
+            MessageBoxW=lambda *args: (_ for _ in ()).throw(OSError('offline')))),
+        raising=False)
+    monkeypatch.setattr(
+        price_alert.subprocess, 'Popen',
+        lambda args, **kwargs: calls.append((args, kwargs)))
+
+    payload = 'x"; Start-Process calc; "'
+    price_alert.show_popup('title', payload)
+
+    args, kwargs = calls[0]
+    assert payload not in args[-1]
+    assert '$env:STOCK_MONITOR_MESSAGE' in args[-1]
+    assert kwargs['env']['STOCK_MONITOR_MESSAGE'] == payload
+
+
+def test_check_multi_rearms_after_condition_clears(monkeypatch, tmp_path):
+    class StopLoop(Exception):
+        pass
+
+    config = tmp_path / 'alerts.json'
+    log = tmp_path / 'alerts.log'
+    config.write_text(json.dumps({
+        'interval': 1, 'log': str(log), 'alerts': [
+            {'code': 'sh600000', 'name': '测试', 'target': 10.0, 'dir': 'below'},
+        ],
+    }), encoding='utf-8')
+    prices = iter([9.0, 11.0, 9.0])
+    sleeps = {'count': 0}
+
+    def fake_sleep(_seconds):
+        sleeps['count'] += 1
+        if sleeps['count'] >= 3:
+            raise StopLoop
+
+    monkeypatch.setattr(price_alert, 'get_quote', lambda *a, **k: {
+        'name': '测试', 'price': next(prices), 'change_pct': 0.0})
+    monkeypatch.setattr(price_alert, 'is_a_share_trading_time', lambda *a: True)
+    monkeypatch.setattr(price_alert, 'quote_is_stale', lambda *a, **k: False)
+    monkeypatch.setattr(price_alert.time, 'sleep', fake_sleep)
+    try:
+        price_alert.check_multi(str(config), source='tencent', notify='log')
+    except StopLoop:
+        pass
+
+    alerts = [line for line in log.read_text(encoding='utf-8').splitlines()
+              if '*** ALERT ***' in line]
+    assert len(alerts) == 2

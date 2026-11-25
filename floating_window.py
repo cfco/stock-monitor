@@ -18,7 +18,7 @@ import logging
 import logging.handlers
 import datetime
 import threading
-import concurrent.futures
+import queue
 
 def _resource_dir():
     """只读资源目录：源码运行时是项目根，打包成 exe 后是 PyInstaller 解包目录。"""
@@ -43,7 +43,7 @@ from price_alert import (
     close_tdx_client, get_quotes_batch, get_kline_1min,
     configure_tdx_nodes, format_price, get_source_health,
     is_a_share_trading_time, is_bj_code, normalize_a_share_code,
-    search_stocks_by_name,
+    price_decimals, quote_is_stale, search_stocks_by_name,
 )
 # 美股（Alpaca 免费版）：实时=WebSocket（alpaca_stream），历史/兜底=REST（alpaca_history）
 import alpaca_history
@@ -390,6 +390,14 @@ def normalize_config(raw):
     if not isinstance(config.get('tdx_host'), str):
         config['tdx_host'] = ''
 
+    alpaca = config.get('alpaca')
+    if not isinstance(alpaca, dict):
+        alpaca = {}
+    else:
+        alpaca = dict(alpaca)
+    alpaca['enabled'] = alpaca.get('enabled') is True
+    config['alpaca'] = alpaca
+
     nodes = config.get('tdx_nodes')
     valid_nodes = []
     if isinstance(nodes, list):
@@ -599,6 +607,7 @@ class QuoteWorker(QThread):
             alerts = config.get('alerts', [])
             loop_success = False
             fresh_count = 0
+            latest_quote_ts = 0.0
             now_str = datetime.datetime.now().strftime('%H:%M:%S')
             is_first_loop = self._first_loop
             a_trading_time = is_a_share_trading_time()
@@ -622,6 +631,12 @@ class QuoteWorker(QThread):
                 if us_sym:
                     us_key.setdefault(us_sym, c)
             us_codes = list(us_key.values())
+            us_data_window = bool(
+                us_key and alpaca_history.has_credentials()
+                and alpaca_history.in_us_data_window())
+            a_active = bool(a_codes and a_trading_time)
+            a_fresh_success = False
+            us_fresh_success = False
 
             results = {}
             # A股交易时间外不刷新行情（首次启动除外，避免空白）
@@ -635,11 +650,6 @@ class QuoteWorker(QThread):
                     results.update({us_key[k]: v for k, v in got.items() if k in us_key})
                 except Exception as e:
                     print(f'[Alpaca] 美股取数异常: {e}')
-            # 休市（A股收盘且列表里没有美股）不是故障：不能计入连续错误，
-            # 否则纯 A 股列表每晚都会误报红点，还反复重建 TDX 连接
-            market_idle = not us_codes and not (a_codes and (is_first_loop or a_trading_time))
-            if market_idle:
-                loop_success = True
             self._first_loop = False
 
             # 串行处理结果
@@ -662,12 +672,28 @@ class QuoteWorker(QThread):
                 if price is None or price <= 0:
                     continue
 
-                loop_success = True
-                fresh_count += 1
                 is_us = is_us_symbol(code)
-                # A 股非交易时段首次启动只展示收盘价，不拿隔夜旧价触发预警。
-                market_live = is_us or a_trading_time
-                stale = not market_live
+                # 非交易时段只展示；盘中还要拒绝上游明确标旧或时间戳过期的行情。
+                market_live = us_data_window if is_us else a_trading_time
+                stale = not market_live or quote_is_stale(
+                    q, max_age=alpaca_history.SNAPSHOT_QUOTE_MAX_AGE if is_us else 90)
+                quote_ts = _finite_float(q.get('quote_ts'))
+                quote_update = (
+                    datetime.datetime.fromtimestamp(quote_ts).strftime('%H:%M:%S')
+                    if quote_ts is not None else now_str
+                )
+                if not stale:
+                    if is_us:
+                        us_fresh_success = True
+                    else:
+                        a_fresh_success = True
+                    fresh_count += 1
+                    latest_quote_ts = max(latest_quote_ts, quote_ts or time.time())
+                else:
+                    # 休市/陈旧行情不参与预警，并解除锁存，下一交易时段可重新提醒。
+                    for side in ('below', 'above'):
+                        self.alert_latches.discard((code, 'price', side))
+                        self.alert_latches.discard((code, 'pct', side))
 
                 # 部分接口会在行情里附带 K 线，直接预填缓存供悬停即时显示
                 klines = q.get('klines', [])
@@ -686,13 +712,13 @@ class QuoteWorker(QThread):
                     'pct_dir': pct_dir,
                     'position': position,
                     'note': note,
-                    'last_update': now_str,
+                    'last_update': quote_update,
                     'stale': stale,
                     'klines': klines,
                 }
                 self.quote_updated.emit(payload)
 
-                if not market_live:
+                if stale:
                     continue
 
                 if target is not None:
@@ -741,6 +767,12 @@ class QuoteWorker(QThread):
                                 'direction': 'above',
                             })
 
+            # 每个活跃市场单独判定；混合监控时不能用美股成功掩盖 A 股失败。
+            market_idle = not a_active and not us_data_window
+            loop_success = market_idle or (
+                (not a_active or a_fresh_success)
+                and (not us_data_window or us_fresh_success)
+            )
             if loop_success:
                 consecutive_errors = 0
                 if self._degraded:
@@ -765,7 +797,9 @@ class QuoteWorker(QThread):
 
             self.batch_done.emit(now_str)
             if fresh_count:
-                self.batch_updated.emit(now_str, fresh_count)
+                latest_update = datetime.datetime.fromtimestamp(
+                    latest_quote_ts).strftime('%H:%M:%S')
+                self.batch_updated.emit(latest_update, fresh_count)
             try:
                 self.source_health_changed.emit(get_source_health())
             except Exception as e:
@@ -828,30 +862,43 @@ class QuoteWorker(QThread):
                 slept += 0.1
 
     def _run_kline_batch(self, tasks, fetch_one, label):
-        """并发预取一组 K 线；单票失败/超时不影响其他票，最终一定释放标志。"""
+        """全局有界队列预取；超时放弃本批结果，后续批次仍可继续。"""
         if not tasks:
             return
-        executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(KLINE_FETCH_WORKERS, len(tasks)),
-            thread_name_prefix=f'kline-{label}',
-        )
-        futures = {executor.submit(fetch_one, *task): task for task in tasks}
-        try:
-            for future in concurrent.futures.as_completed(
-                    futures, timeout=KLINE_FETCH_TIMEOUT):
-                task = futures[future]
-                try:
-                    cache_key, klines = future.result()
-                except Exception as e:
-                    print(f'[Kline {label}] {task} failed: {e}')
-                    continue
-                if klines:
-                    self._kline_put(cache_key, klines)
-        except concurrent.futures.TimeoutError:
-            print(f'[Kline {label}] 预取超过 {KLINE_FETCH_TIMEOUT}s，本轮未完成的请求跳过')
-        finally:
-            # 不阻塞取数主循环：仍卡在 HTTP 超时里的线程自行结束，不会阻止进程退出
-            executor.shutdown(wait=False, cancel_futures=True)
+        _ensure_kline_workers()
+        cancelled = threading.Event()
+        done = threading.Event()
+        remaining = [len(tasks)]
+        counter_lock = threading.Lock()
+
+        def finish_one():
+            with counter_lock:
+                remaining[0] -= 1
+                if remaining[0] == 0:
+                    done.set()
+
+        deadline = time.monotonic() + KLINE_FETCH_TIMEOUT
+        for task in tasks:
+            item = (self, fetch_one, task, label, cancelled, finish_one)
+            try:
+                _kline_queue.put_nowait(item)
+                continue
+            except queue.Full:
+                pass
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0:
+                cancelled.set()
+                print(f'[Kline {label}] 预取队列已满，放弃本批')
+                return
+            try:
+                _kline_queue.put(item, timeout=remaining_time)
+            except queue.Full:
+                cancelled.set()
+                print(f'[Kline {label}] 预取队列已满，放弃本批')
+                return
+        if not done.wait(max(0, deadline - time.monotonic())):
+            cancelled.set()
+            print(f'[Kline {label}] 预取超过 {KLINE_FETCH_TIMEOUT}s，放弃本批剩余结果')
 
     def _fetch_a_share_klines(self, codes):
         """后台线程: 获取A股1分钟K线并缓存（并发上限 4）"""
@@ -939,9 +986,124 @@ KLINE_SIZES = {
 }
 
 # K 线预取并发上限：免费接口对同一 IP 有频率限制，4 路足够覆盖几十只自选股；
-# 整体超时避免某个卡死的连接让本轮预取标志永远不释放。
+# 使用全局守护线程池，批次超时后释放旗标，卡死任务不会叠加线程或阻止退出。
 KLINE_FETCH_WORKERS = 4
 KLINE_FETCH_TIMEOUT = 20
+_kline_queue = queue.Queue(maxsize=KLINE_FETCH_WORKERS * 4)
+_kline_workers_started = False
+_kline_workers_lock = threading.Lock()
+
+
+def _kline_worker():
+    while True:
+        owner, fetch_one, task, label, cancelled, finish_one = _kline_queue.get()
+        try:
+            if cancelled.is_set():
+                continue
+            try:
+                cache_key, klines = fetch_one(*task)
+                if klines and not cancelled.is_set():
+                    owner._kline_put(cache_key, klines)
+            except Exception as e:
+                print(f'[Kline {label}] {task} failed: {e}')
+        finally:
+            finish_one()
+            _kline_queue.task_done()
+
+
+def _ensure_kline_workers():
+    global _kline_workers_started
+    with _kline_workers_lock:
+        if _kline_workers_started:
+            return
+        for i in range(KLINE_FETCH_WORKERS):
+            threading.Thread(target=_kline_worker, daemon=True,
+                             name=f'kline-worker-{i}').start()
+        _kline_workers_started = True
+
+
+def compute_kline_axis(high, low, close, decimals):
+    """计算 K 线纵轴：按 tick 整数倍取步长，等分 5 段。
+
+    参数:
+      high/low: 当前可见K线的最高价/最低价
+      close:    最新收盘价，用于决定余量留在上方还是下方
+      decimals: 价格小数位（股票/指数 2，基金/ETF 3）
+
+    返回:
+      (axis_min, axis_max, labels, divisions)
+      labels 从上到下共 divisions+1 个刻度文本；divisions 为实际显示的份数。
+      整行都没有K线的空行会被剔除，剩余行重新占满绘图高度（5份 → 4份…）。
+
+    规则:
+      1. 步长向上取整到 1 个最小变动单位（股票 1 分、基金 0.1 分），
+         保证每条网格线的值都落在整数分上；
+      2. 5 段总跨度与真实波幅的差额（不足 5 个 tick）整块留在上方或下方：
+         当前价靠近上沿 → 空在上方，靠近下沿 → 空在下方，给走势留预判空间；
+      3. 若某一整行完全没有K线，该行不显示，显示份数相应减少。
+    """
+    tick = 10 ** (-decimals)
+    data_lo = math.floor(low / tick)
+    data_hi = math.ceil(high / tick)
+    span_ticks = data_hi - data_lo
+    try:
+        close = float(close)
+    except (TypeError, ValueError):
+        close = (low + high) / 2
+
+    if span_ticks <= 0:
+        # 平盘/只有一根K线：固定 1 tick 步长，把价格放在中间，避免贴边
+        step_ticks = 1
+        bottom_tick = data_lo - 2
+        top_tick = bottom_tick + step_ticks * 5
+        divisions = 5
+        axis_min = bottom_tick * tick
+        axis_max = top_tick * tick
+        labels = [f'{((top_tick - step_ticks * i) * tick):.{decimals}f}'
+                  for i in range(divisions + 1)]
+        return axis_min, axis_max, labels, divisions
+
+    step_ticks = max(1, math.ceil(span_ticks / 5))
+    if close >= (low + high) / 2:
+        bottom_tick = data_lo
+        top_tick = data_lo + step_ticks * 5
+    else:
+        top_tick = data_hi
+        bottom_tick = data_hi - step_ticks * 5
+
+    # 5等分定位不变；整行都落在真实价格区间之外（该行没有任何K线）时，
+    # 该行不再显示：把上下边界收缩到真正有K线的行，剩余行重新占满绘图区。
+    # 例如原来 5 份里有 1 份全空 → 实际显示 4 份；波动更小则继续减少。
+    # 注意：K线只是擦到行的边界不算占用该行，否则贴着最低/最高价的那一行
+    # 会被误判为有数据，看起来整行空白却仍显示。
+    occupied = []
+    for i in range(5):
+        upper_tick = top_tick - step_ticks * i
+        lower_tick = upper_tick - step_ticks
+        if lower_tick >= data_hi or upper_tick <= data_lo:
+            continue    # 整行在最高价之上 / 最低价之下 → 空行，丢弃
+        occupied.append(i)
+    if not occupied:
+        # 极端情况（如平盘）：所有行内部都没有K线，保留包含当前价的那一行
+        close_tick = int(round(close / tick))
+        for i in range(5):
+            upper_tick = top_tick - step_ticks * i
+            lower_tick = upper_tick - step_ticks
+            if lower_tick <= close_tick <= upper_tick:
+                occupied = [i]
+                break
+        else:
+            occupied = [2]
+    first, last = occupied[0], occupied[-1]
+    display_top = top_tick - step_ticks * first
+    display_bottom = top_tick - step_ticks * (last + 1)
+    divisions = max(1, int(round((display_top - display_bottom) / step_ticks)))
+
+    axis_min = display_bottom * tick
+    axis_max = display_top * tick
+    labels = [f'{((display_top - step_ticks * i) * tick):.{decimals}f}'
+              for i in range(divisions + 1)]
+    return axis_min, axis_max, labels, divisions
 
 
 # ============================================================
@@ -1122,23 +1284,44 @@ class KlineTooltip(QWidget):
         w = self.width() - 20
         h = self.height() - 42
 
+        # 价格范围：纵轴上下界取当前可见K线的最高价/最低价
+        max_price = max(k['high'] for k in self.klines)
+        min_price = min(k['low'] for k in self.klines)
+
+        # 纵轴刻度：步长取「整数分」并等分 5 段，余量按当前价位置留上/下。
+        # 股票/指数按 1 分对齐，基金/ETF 按 0.1 分对齐（见 compute_kline_axis）。
+        # divisions 为最终显示的份数：整行无K线的空行已被剔除并重新占满高度。
+        decimals = price_decimals(self.code)
+        axis_min, axis_max, axis_labels, divisions = compute_kline_axis(
+            max_price, min_price, self.klines[-1].get('close'), decimals)
+        price_range = axis_max - axis_min
+
+        # 刻度文字放右侧独立列，避免压在蜡烛上；先测量最宽标签再让出空间，
+        # 保证 small(320px) 窗口下 K 线仍有足够绘制宽度。
+        p.setFont(QFont('Microsoft YaHei UI', 7))
+        fm = p.fontMetrics()
+        label_w = max(fm.horizontalAdvance(t) for t in axis_labels) + 4
+        chart_w = max(10, w - label_w - 4)
+
         n = len(self.klines)
         # 浮点步长全量压缩：分时已是当天全量数据(~240根)，原先固定
         # 2px蜡烛+1px间隔在 small(320px) 宽度下只能画 ~100 根，画不下全天。
         # 改为步长 = 绘制区宽 / n 自适应，蜡烛宽度最小压到 1px；
         # 少量数据（日K/周K 60根）时步长变大，蜡烛自动变宽，行为与原先一致
-        step = w / n if n else 1.0
+        step = chart_w / n if n else 1.0
         bar_w = max(1, int(step) - 1)
 
-        # 价格范围
-        max_price = max(k['high'] for k in self.klines)
-        min_price = min(k['low'] for k in self.klines)
-        price_range = max_price - min_price
-        if price_range == 0:
-            price_range = max(0.01, abs(max_price) * 0.001)
-
         def price_to_y(price):
-            return y0 + h - (price - min_price) / price_range * h
+            return y0 + h - (price - axis_min) / price_range * h
+
+        # 横向网格线先画、垫在K线下方：浅色虚线，不遮挡蜡烛主体。
+        # 空行已在 compute_kline_axis 中剔除，这里按最终份数等分绘图高度。
+        grid_color = QColor(get_color('text_dim'))
+        grid_color.setAlpha(90)
+        p.setPen(QPen(grid_color, 1, Qt.DashLine))
+        for i in range(divisions + 1):
+            gy = int(round(y0 + h * i / divisions))
+            p.drawLine(x0, gy, x0 + chart_w, gy)
 
         # 画K线
         for i, k in enumerate(self.klines):
@@ -1163,11 +1346,21 @@ class KlineTooltip(QWidget):
             p.setBrush(QBrush(color))
             p.drawRect(x, body_top, bar_w, body_h)
 
-        # 价格标注
+        # 纵轴刻度值（右侧）：顶部标签贴线下方、底部标签贴线上方，
+        # 避免与标题行、底部时间行重叠；中间标签垂直居中于网格线。
         p.setPen(QColor(get_color('text_dim')))
-        p.setFont(QFont('Microsoft YaHei UI', 7))
-        p.drawText(x0 + 2, y0 + 8, self._price_fmt(max_price))
-        p.drawText(x0 + 2, y0 + h, self._price_fmt(min_price))
+        line_h = fm.height()
+        label_x = x0 + chart_w + 4
+        for i, text in enumerate(axis_labels):
+            gy = y0 + h * i / divisions
+            if i == 0:
+                top = gy + 1
+            elif i == divisions:
+                top = gy - line_h - 1
+            else:
+                top = gy - line_h / 2
+            p.drawText(QRect(int(label_x), int(top), label_w, line_h),
+                       Qt.AlignRight | Qt.AlignVCenter, text)
 
         # 时间标注
         if n > 0:
@@ -1458,13 +1651,14 @@ class QuoteCard(QFrame):
 
         # 触发判断：目标价 OR 涨跌幅。触发与否只以卡片绿底表达，不显示预警文字。
         triggered = False
+        stale = bool(data.get('stale'))
 
-        if target is not None and price is not None:
+        if not stale and target is not None and price is not None:
             # 判定口径与 QuoteWorker 共用模块级 check_price_alert，避免两处分叉
             hit, _ = check_price_alert(price, target, direction)
             triggered = hit
 
-        if not triggered and target_pct is not None and change_pct is not None:
+        if not stale and not triggered and target_pct is not None and change_pct is not None:
             # 判定口径与 QuoteWorker 共用同一函数，避免两处逻辑再次分叉
             pct_hit, _ = check_pct_alert(
                 change_pct, target_pct, data.get('pct_dir', 'both')
@@ -1650,9 +1844,13 @@ class AlpacaCredsDialog(QDialog):
         self.setMinimumWidth(400)
 
         layout = QVBoxLayout(self)
-        tip = QLabel(
-            '输入 Alpaca API Key / Secret（免费版即可，paper 账户）。\n'
+        storage_tip = (
             '凭证经 Windows DPAPI 加密后仅保存在本机配置文件，不会明文落盘。'
+            if sys.platform == 'win32'
+            else '当前平台不支持安全凭证持久化；请使用 Windows，凭证不会保存到配置文件。'
+        )
+        tip = QLabel(
+            '输入 Alpaca API Key / Secret（免费版即可，paper 账户）。\n' + storage_tip
         )
         tip.setWordWrap(True)
         layout.addWidget(tip)
@@ -1717,6 +1915,7 @@ class SettingsDialog(QDialog):
         self.table.cellChanged.connect(self._on_code_changed)
         self._block_signals = False  # 防止信号循环
         self._resolve_thread = None  # 异步查询线程引用
+        self._resolve_generations = {}
 
     def _build_ui(self):
         self.setWindowTitle('监控设置')
@@ -1790,7 +1989,9 @@ class SettingsDialog(QDialog):
         # Alpaca（美股）配置区：设置页不显示任何账号信息；
         # 勾选启用时才弹窗输入凭证（DPAPI 加密存本地），取消勾选不清除已存凭证。
         # 注意：必须先 setChecked 再连 toggled，否则已启用状态下每次打开设置都会弹窗
-        alc_cfg = self.config.get('alpaca') or {}
+        alc_cfg = self.config.get('alpaca')
+        if not isinstance(alc_cfg, dict):
+            alc_cfg = {}
         self.us_enable_check = QCheckBox('启用美股（夜盘实时 WS + REST 历史K线）')
         self.us_enable_check.setChecked(bool(alc_cfg.get('enabled')))
         self.us_enable_check.toggled.connect(self._on_us_enable_toggled)
@@ -1985,12 +2186,23 @@ class SettingsDialog(QDialog):
             return
         text = item.text().strip()
         if not text:
+            code_item = item if col == 0 else self.table.item(row, 0)
+            if code_item is not None:
+                request_key = id(code_item)
+                self._resolve_generations[request_key] = (
+                    self._resolve_generations.get(request_key, 0) + 1)
             return
 
         if col == 1:
             # 只在代码为空时反查（新增股票场景）；已有代码说明是手动改名称，不打扰
             code_item = self.table.item(row, 0)
-            if code_item is None or code_item.text().strip():
+            if code_item is None:
+                return
+            if code_item.text().strip():
+                # 手动改名称时，使该行尚未返回的代码解析失效，避免旧结果覆盖新名称。
+                request_key = id(code_item)
+                self._resolve_generations[request_key] = (
+                    self._resolve_generations.get(request_key, 0) + 1)
                 return
             target_item, name_item = code_item, item
         else:
@@ -2008,7 +2220,12 @@ class SettingsDialog(QDialog):
         # 回调必须绑定「发出信号的那个线程」：原先是从 self._resolve_thread 反查 item，
         # 旧线程已结束但排队中的回调会把候选写进新线程的行 —— 名称/代码错挂到别的股票。
         # 绑定后既不用 wait 阻塞界面，也不用担心误删引用（运行中的 QThread 被 GC 会 abort）。
+        request_key = id(target_item)
+        generation = self._resolve_generations.get(request_key, 0) + 1
+        self._resolve_generations[request_key] = generation
         th = _StockResolveThread(text)
+        th._generation = generation
+        th._request_key = request_key
         th._row = row
         th._item = target_item
         th._name_item = name_item
@@ -2023,10 +2240,18 @@ class SettingsDialog(QDialog):
         """异步查询完成回调(在主线程执行)；只写发起这次查询的那一行"""
         if not candidates:
             return
+        request_key = getattr(thread, '_request_key', None)
+        if request_key is None or self._resolve_generations.get(request_key) != thread._generation:
+            return
+        row = getattr(thread, '_row', -1)
+        if row < 0 or row >= self.table.rowCount():
+            return
 
         item = getattr(thread, '_item', None)
         name_item = getattr(thread, '_name_item', None)
-        if item is None:
+        if item is None or self.table.item(row, 0) is not item:
+            return
+        if name_item is not None and self.table.item(row, 1) is not name_item:
             return
 
         chosen = None
@@ -2073,7 +2298,12 @@ class SettingsDialog(QDialog):
                 self._set_us_check_silent(False)
                 return
             # DPAPI 加密写入内存段（点「保存」时随其它设置一起写盘）
-            secret_store.store_alpaca_creds(alc, k, s)
+            try:
+                secret_store.store_alpaca_creds(alc, k, s)
+            except (secret_store.SecretStoreError, OSError) as e:
+                QMessageBox.warning(self, '无法安全保存凭证', str(e))
+                self._set_us_check_silent(False)
+                return
         else:
             self._set_us_check_silent(False)
 
@@ -2601,10 +2831,13 @@ class FloatingWindow(QWidget):
 
         启动与「设置保存」两条路径都经过这里，保证凭证/订阅列表变更即时生效。
         """
-        alc = self.config.get('alpaca') or {}
+        alc = self.config.get('alpaca')
+        if not isinstance(alc, dict):
+            alc = {}
         # 凭证从密文字段解密后只进内存（alpaca_history 模块级），不打印到任何日志
         key, secret = secret_store.load_alpaca_creds(alc)
         alpaca_history.configure(key, secret)
+        alpaca_stream.credentials_changed()
         us_codes = [
             normalize_us_symbol(item.get('code', ''))
             for item in self.config.get('alerts', [])

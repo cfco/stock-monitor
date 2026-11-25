@@ -1,6 +1,7 @@
 """P0 回归：取数线程不能静默死掉 + 设置表格删行按按钮定位真实行"""
 import os
 import sys
+import datetime
 import threading
 import time
 import types
@@ -228,8 +229,11 @@ def test_resolve_callback_writes_to_the_row_that_asked(qapp):
     table.setItem(1, 0, item_b)
     dialog = types.SimpleNamespace(
         table=table, _block_signals=False,
+        _resolve_generations={id(item_a): 2},
         _resolve_thread=types.SimpleNamespace(_item=item_b, _name_item=None))
-    thread_a = types.SimpleNamespace(_item=item_a, _name_item=None)
+    thread_a = types.SimpleNamespace(
+        _item=item_a, _name_item=None, _row=0, _generation=2,
+        _request_key=id(item_a))
 
     fw.SettingsDialog._on_resolve_done(dialog, [('sh600000', '浦发银行')], thread_a)
 
@@ -564,6 +568,309 @@ def test_stale_card_grays_price_and_shows_position_note(qapp):
     })
     assert fw.COLOR_FLAT not in card.price_label.styleSheet()
     assert '备注' not in card.name_label.toolTip()
+
+
+def test_stale_resolve_callback_does_not_overwrite_new_input(qapp):
+    table = QTableWidget(1, 2)
+    item = QTableWidgetItem('sh601398')
+    name = QTableWidgetItem('工商银行')
+    table.setItem(0, 0, item)
+    table.setItem(0, 1, name)
+    dialog = types.SimpleNamespace(
+        table=table, _block_signals=False,
+        _resolve_generations={id(item): 3})
+    old_thread = types.SimpleNamespace(
+        _item=item, _name_item=name, _row=0, _generation=2,
+        _request_key=id(item))
+
+    fw.SettingsDialog._on_resolve_done(
+        dialog, [('sh600000', '浦发银行')], old_thread)
+
+    assert item.text() == 'sh601398'
+    assert name.text() == '工商银行'
+
+
+def test_clearing_cell_invalidates_pending_resolve(qapp):
+    table = QTableWidget(1, 2)
+    item = QTableWidgetItem('sh600000')
+    table.setItem(0, 0, item)
+    dialog = types.SimpleNamespace(
+        table=table, _block_signals=False, _resolve_generations={id(item): 1})
+    thread = types.SimpleNamespace(
+        _item=item, _name_item=None, _row=0, _generation=1,
+        _request_key=id(item))
+    item.setText('')
+
+    fw.SettingsDialog._on_code_changed(dialog, 0, 0)
+    fw.SettingsDialog._on_resolve_done(dialog, [('sh600000', '浦发银行')], thread)
+
+    assert item.text() == ''
+
+
+def test_resolve_generations_are_independent_per_cell(qapp):
+    table = QTableWidget(2, 2)
+    item_a, item_b = QTableWidgetItem(''), QTableWidgetItem('')
+    table.setItem(0, 0, item_a)
+    table.setItem(1, 0, item_b)
+    dialog = types.SimpleNamespace(
+        table=table, _block_signals=False,
+        _resolve_generations={id(item_a): 1, id(item_b): 2})
+    thread_a = types.SimpleNamespace(
+        _item=item_a, _name_item=None, _row=0, _generation=1,
+        _request_key=id(item_a))
+    thread_b = types.SimpleNamespace(
+        _item=item_b, _name_item=None, _row=1, _generation=2,
+        _request_key=id(item_b))
+
+    fw.SettingsDialog._on_resolve_done(dialog, [('sh600000', '浦发银行')], thread_a)
+    fw.SettingsDialog._on_resolve_done(dialog, [('sh601398', '工商银行')], thread_b)
+
+    assert item_a.text() == 'sh600000'
+    assert item_b.text() == 'sh601398'
+
+
+def test_resolve_callback_ignores_deleted_row(qapp):
+    table = QTableWidget(1, 2)
+    item = QTableWidgetItem('sh600000')
+    table.setItem(0, 0, item)
+    dialog = types.SimpleNamespace(
+        table=table, _block_signals=False,
+        _resolve_generations={id(item): 1})
+    thread = types.SimpleNamespace(
+        _item=item, _name_item=None, _row=0, _generation=1,
+        _request_key=id(item))
+    table.removeRow(0)
+
+    fw.SettingsDialog._on_resolve_done(dialog, [('sh600000', '浦发银行')], thread)
+    assert table.rowCount() == 0
+
+
+def test_stale_a_share_quote_does_not_trigger_alert(qapp, monkeypatch):
+    worker = _quiet_worker(fw.QuoteWorker({
+        'interval': 1, 'source': 'auto', 'alerts': [
+            {'code': 'sh600000', 'name': '浦发银行', 'target': 10.0, 'dir': 'below'},
+        ],
+    }), monkeypatch)
+    worker._first_loop = False
+    monkeypatch.setattr(fw, 'is_a_share_trading_time', lambda *a: True)
+    monkeypatch.setattr(fw, 'get_quotes_batch', lambda codes, source='auto': {
+        'sh600000': {'price': 9.0, 'change_pct': -1.0,
+                     'quote_ts': time.time() - 3600},
+    })
+    alerts, payloads, rounds = [], [], []
+    worker.alert_triggered.connect(alerts.append)
+    worker.quote_updated.connect(payloads.append)
+    worker.batch_done.connect(lambda _ts: _stop_after(worker, rounds, 1))
+
+    worker._run_loop()
+
+    assert alerts == []
+    assert payloads[0]['stale'] is True
+    assert payloads[0]['last_update'] != '--'
+
+
+def test_us_off_hours_quote_does_not_trigger_alert(qapp, monkeypatch):
+    worker = _quiet_worker(fw.QuoteWorker({
+        'interval': 1, 'source': 'auto', 'alpaca': {'enabled': True}, 'alerts': [
+            {'code': 'AAPL', 'name': '苹果', 'target': 200.0, 'dir': 'below'},
+        ],
+    }), monkeypatch)
+    worker._first_loop = False
+    monkeypatch.setattr(fw.alpaca_history, 'in_us_data_window', lambda *a: False)
+    monkeypatch.setattr(fw.alpaca_stream, 'get_quotes_batch', lambda codes: {
+        'AAPL': {'price': 190.0, 'change_pct': -1.0, 'stale': True},
+    })
+    alerts, payloads, rounds = [], [], []
+    worker.alert_triggered.connect(alerts.append)
+    worker.quote_updated.connect(payloads.append)
+    worker.batch_done.connect(lambda _ts: _stop_after(worker, rounds, 1))
+
+    worker._run_loop()
+
+    assert alerts == []
+    assert payloads[0]['stale'] is True
+
+
+def test_us_without_credentials_does_not_mask_a_share_success(qapp, monkeypatch):
+    worker = _quiet_worker(fw.QuoteWorker({
+        'interval': 1, 'source': 'auto', 'alpaca': {'enabled': True}, 'alerts': [
+            {'code': 'sh600000', 'name': '浦发银行'},
+            {'code': 'AAPL', 'name': '苹果'},
+        ],
+    }), monkeypatch)
+    worker._first_loop = False
+    worker._last_status = 'running'
+    monkeypatch.setattr(fw, 'is_a_share_trading_time', lambda *a: True)
+    monkeypatch.setattr(fw.alpaca_history, 'has_credentials', lambda: False)
+    monkeypatch.setattr(fw.alpaca_history, 'in_us_data_window', lambda *a: True)
+    monkeypatch.setattr(fw, 'get_quotes_batch', lambda codes, source='auto': {
+        'sh600000': {'price': 10.0, 'change_pct': 1.0}})
+    monkeypatch.setattr(fw.alpaca_stream, 'get_quotes_batch', lambda codes: {})
+    statuses, rounds = [], []
+    worker.status_changed.connect(statuses.append)
+    worker.batch_done.connect(lambda _ts: _stop_after(worker, rounds, 10))
+
+    worker._run_loop()
+
+    assert statuses == []
+
+
+def test_us_success_does_not_mask_a_share_failure(qapp, monkeypatch):
+    worker = _quiet_worker(fw.QuoteWorker({
+        'interval': 1, 'source': 'auto', 'alpaca': {'enabled': True}, 'alerts': [
+            {'code': 'sh600000', 'name': '浦发银行'},
+            {'code': 'AAPL', 'name': '苹果'},
+        ],
+    }), monkeypatch)
+    worker._first_loop = False
+    worker._last_status = 'running'
+    monkeypatch.setattr(fw, 'is_a_share_trading_time', lambda *a: True)
+    monkeypatch.setattr(fw.alpaca_history, 'has_credentials', lambda: True)
+    monkeypatch.setattr(fw.alpaca_history, 'in_us_data_window', lambda *a: True)
+    monkeypatch.setattr(fw, 'get_quotes_batch', lambda codes, source='auto': {})
+    monkeypatch.setattr(fw.alpaca_stream, 'get_quotes_batch', lambda codes: {
+        'AAPL': {'price': 190.0, 'change_pct': 1.0},
+    })
+    statuses, rounds = [], []
+    worker.status_changed.connect(statuses.append)
+    worker.batch_done.connect(lambda _ts: _stop_after(worker, rounds, 10))
+
+    worker._run_loop()
+
+    assert statuses == ['error']
+
+
+def test_quote_timestamp_is_shown_instead_of_fetch_time(qapp, monkeypatch):
+    worker = _quiet_worker(fw.QuoteWorker({
+        'interval': 1, 'source': 'auto', 'alerts': [{'code': 'sh600000'}],
+    }), monkeypatch)
+    worker._first_loop = False
+    quote_ts = time.time() - 5
+    expected = datetime.datetime.fromtimestamp(quote_ts).strftime('%H:%M:%S')
+    monkeypatch.setattr(fw, 'is_a_share_trading_time', lambda *a: True)
+    monkeypatch.setattr(fw, 'get_quotes_batch', lambda codes, source='auto': {
+        'sh600000': {'price': 10.0, 'change_pct': 1.0, 'quote_ts': quote_ts},
+    })
+    payloads, rounds = [], []
+    worker.quote_updated.connect(payloads.append)
+    worker.batch_done.connect(lambda _ts: _stop_after(worker, rounds, 1))
+
+    worker._run_loop()
+
+    assert payloads[0]['last_update'] == expected
+
+
+def test_kline_axis_contains_raw_extremes_and_centers_flat_price():
+    low, high = 10.006, 10.034
+    axis_min, axis_max, labels, divisions = fw.compute_kline_axis(
+        high, low, high, 2)
+    assert axis_min <= low < high <= axis_max
+    assert len(labels) == divisions + 1
+
+    axis_min, axis_max, labels, divisions = fw.compute_kline_axis(100, 100, 100, 2)
+    assert axis_min < 100 < axis_max
+    assert divisions == 5
+
+
+def test_stale_card_does_not_show_triggered_style(qapp):
+    card = fw.QuoteCard('sh601398', '工商银行')
+    card.set_data({'price': 6.5, 'change_pct': -1.0,
+                   'target': 7.0, 'direction': 'below'})
+    assert card._triggered is True
+
+    card.set_data({'price': 6.5, 'change_pct': -1.0, 'stale': True,
+                   'target': 7.0, 'direction': 'below'})
+    assert card._triggered is False
+
+
+def test_settings_dialog_accepts_malformed_alpaca_section(qapp):
+    dlg = fw.SettingsDialog({'interval': 5, 'alerts': [], 'alpaca': 'bad'})
+    assert dlg.us_enable_check.isChecked() is False
+    dlg.deleteLater()
+
+
+def test_apply_alpaca_config_notifies_credentials_change(monkeypatch):
+    calls = []
+    win = types.SimpleNamespace(config={'alpaca': {'enabled': False}, 'alerts': []})
+    monkeypatch.setattr(fw.secret_store, 'load_alpaca_creds', lambda alc: ('k', 's'))
+    monkeypatch.setattr(fw.alpaca_history, 'configure', lambda k, s: calls.append(('configure', k, s)))
+    monkeypatch.setattr(fw.alpaca_stream, 'credentials_changed',
+                        lambda: calls.append(('credentials_changed',)))
+    monkeypatch.setattr(fw.alpaca_stream, 'stop', lambda: calls.append(('stop',)))
+
+    fw.FloatingWindow._apply_alpaca_config(win)
+
+    assert calls == [('configure', 'k', 's'), ('credentials_changed',), ('stop',)]
+
+
+def test_kline_batch_waits_for_daemon_workers_without_overlap(monkeypatch):
+    worker = fw.QuoteWorker({'interval': 1, 'alerts': []})
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    worker._us_kline_fetching = True
+
+    def fetch(code, period, count):
+        started.set()
+        assert release.wait(2)
+        return f'{code}_{period}', [{'time': '09:30', 'close': 10.0}]
+
+    monkeypatch.setattr(fw.alpaca_history, 'get_kline', fetch)
+    thread = threading.Thread(target=lambda: (
+        worker._fetch_us_klines(['AAPL']), finished.set()), daemon=True)
+    thread.start()
+    assert started.wait(2)
+    assert finished.is_set() is False
+    assert worker._us_kline_fetching is True
+    release.set()
+    thread.join(2)
+
+    assert finished.is_set() is True
+    assert worker._us_kline_fetching is False
+    assert worker._kline_get('AAPL')[1]
+
+
+def test_kline_batch_timeout_releases_flag_and_next_batch_runs(monkeypatch):
+    worker = fw.QuoteWorker({'interval': 1, 'alerts': []})
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    worker._us_kline_fetching = True
+    monkeypatch.setattr(fw, 'KLINE_FETCH_TIMEOUT', 0.05)
+
+    def stuck(code, period, count):
+        started.set()
+        release.wait(2)
+        return code, [{'time': '09:30', 'close': 10.0}]
+
+    monkeypatch.setattr(fw.alpaca_history, 'get_kline', stuck)
+    thread = threading.Thread(target=lambda: (
+        worker._fetch_us_klines(['AAPL']), finished.set()), daemon=True)
+    thread.start()
+    assert started.wait(2)
+    thread.join(2)
+    assert finished.is_set() is True
+    assert worker._us_kline_fetching is False
+
+    worker._run_kline_batch(
+        [('MSFT',)], lambda code: (code, [{'time': '09:30', 'close': 20.0}]), '测试')
+    assert worker._kline_get('MSFT')[1]
+    release.set()
+
+
+def test_kline_queue_is_bounded_when_all_workers_are_stuck(monkeypatch):
+    blocked_queue = fw.queue.Queue(maxsize=1)
+    blocked_queue.put_nowait(('occupied',))
+    monkeypatch.setattr(fw, '_kline_queue', blocked_queue)
+    monkeypatch.setattr(fw, '_ensure_kline_workers', lambda: None)
+    monkeypatch.setattr(fw, 'KLINE_FETCH_TIMEOUT', 0.05)
+    worker = fw.QuoteWorker({'interval': 1, 'alerts': []})
+
+    worker._run_kline_batch(
+        [('AAPL',)], lambda code: (code, [{'close': 10.0}]), '测试')
+
+    assert blocked_queue.maxsize == 1
+    assert blocked_queue.qsize() == 1
 
 
 def _stop_after(worker, rounds, limit):

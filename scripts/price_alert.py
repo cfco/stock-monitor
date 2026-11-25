@@ -200,6 +200,59 @@ def is_a_share_trading_day(now=None):
     return local.date().isoformat() not in CN_MARKET_HOLIDAYS
 
 
+QUOTE_MAX_AGE_SECONDS = 90
+
+
+def _epoch_seconds(value):
+    value = _finite_float(value)
+    if value is None:
+        return None
+    if value > 100_000_000_000:
+        value /= 1000
+    return value
+
+
+def _cn_timestamp(date_value, time_value):
+    date_text = str(date_value or '').strip()
+    time_text = str(time_value or '').strip()
+    if date_text.endswith('.0'):
+        date_text = date_text[:-2]
+    if time_text.endswith('.0'):
+        time_text = time_text[:-2]
+    if len(time_text) in (4, 5) and time_text.isdigit():
+        time_text = time_text.zfill(6)
+    if len(date_text) == 8 and date_text.isdigit() and len(time_text) == 6 and time_text.isdigit():
+        try:
+            return datetime.datetime.strptime(
+                date_text + time_text, '%Y%m%d%H%M%S'
+            ).replace(tzinfo=CN_TZ).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_cn_quote_time(value):
+    text = str(value or '').strip()
+    for fmt, length in (('%Y-%m-%d %H:%M:%S', 19), ('%Y-%m-%d %H:%M', 16)):
+        try:
+            return datetime.datetime.strptime(text[:length], fmt).replace(
+                tzinfo=CN_TZ).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def quote_is_stale(quote, now=None, max_age=QUOTE_MAX_AGE_SECONDS):
+    """行情时间戳明显过期时为真；没有时间戳的源由调用方按市场时段判断。"""
+    if not isinstance(quote, dict) or quote.get('stale'):
+        return True
+    timestamp = _epoch_seconds(quote.get('quote_ts'))
+    if timestamp is None:
+        return False
+    now_ts = time.time() if now is None else now
+    return now_ts - timestamp > max_age or timestamp - now_ts > 60
+
+
 def is_a_share_trading_time(now=None):
     """判断当前是否在 A 股连续竞价/集合竞价时段（Asia/Shanghai）。
 
@@ -209,9 +262,9 @@ def is_a_share_trading_time(now=None):
     local = market_now(now)
     if not is_a_share_trading_day(local):
         return False
-    minutes = local.hour * 60 + local.minute
-    # 9:25=565, 11:30=690, 13:00=780, 15:00=900
-    return 565 <= minutes <= 690 or 780 <= minutes <= 900
+    current = local.time().replace(tzinfo=None)
+    return (datetime.time(9, 25) <= current <= datetime.time(11, 30)
+            or datetime.time(13, 0) <= current <= datetime.time(15, 0))
 
 # ============================================================
 # 接口失败跟踪器（连续 5 次无效返回 → 临时屏蔽 300 秒，到期自动解封）
@@ -378,7 +431,7 @@ def _batch_has_valid_result(results, codes):
         1 for c in codes
         if c in results and _is_usable_quote(results[c], require_change_pct=True)
     )
-    return valid >= max(1, len(codes) // 2)
+    return valid >= max(1, (len(codes) + 1) // 2)
 
 
 # ============================================================
@@ -513,14 +566,19 @@ def show_popup(title, message):
         # 如果MessageBox不可用，回退到PowerShell弹窗
         try:
             ps_cmd = (
-                f'Add-Type -AssemblyName System.Windows.Forms; '
-                f'[System.Windows.Forms.MessageBox]::Show("{message}", "{title}", '
-                f'[System.Windows.Forms.MessageBoxButtons]::OK, '
-                f'[System.Windows.Forms.MessageBoxIcon]::Warning)'
+                'Add-Type -AssemblyName System.Windows.Forms; '
+                '[System.Windows.Forms.MessageBox]::Show('
+                '$env:STOCK_MONITOR_MESSAGE, $env:STOCK_MONITOR_TITLE, '
+                '[System.Windows.Forms.MessageBoxButtons]::OK, '
+                '[System.Windows.Forms.MessageBoxIcon]::Warning)'
             )
+            env = os.environ.copy()
+            env['STOCK_MONITOR_MESSAGE'] = message
+            env['STOCK_MONITOR_TITLE'] = title
             subprocess.Popen(
                 ['powershell', '-NoProfile', '-Command', ps_cmd],
-                creationflags=subprocess.CREATE_NO_WINDOW
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                env=env,
             )
         except Exception:
             print(f'[POPUP FAILED] {title}: {message}')
@@ -568,6 +626,10 @@ def get_quote_tdx(code, host=None):
         'volume': q.total_hand,
         'amount': q.amount,
         'change_pct': change_pct,
+        'quote_ts': _cn_timestamp(
+            market_now().strftime('%Y%m%d'),
+            getattr(q, 'time_raw', getattr(q, 'server_time_raw', '')),
+        ),
         # 盘口
         'bid1': q.buy_levels[0].price if q.buy_levels else None,
         'bid1_vol': q.buy_levels[0].volume if q.buy_levels else None,
@@ -587,6 +649,8 @@ _TENCENT_F_OPEN = 5
 _TENCENT_F_CHANGE_PCT = 32
 _TENCENT_F_HIGH = 33
 _TENCENT_F_LOW = 34
+_TENCENT_F_DATE = 30
+_TENCENT_F_TIME = 31
 
 
 def _parse_tencent_response(text):
@@ -608,6 +672,10 @@ def _parse_tencent_response(text):
             'high': float(f[_TENCENT_F_HIGH]) if len(f) > _TENCENT_F_HIGH and f[_TENCENT_F_HIGH] else None,
             'low': float(f[_TENCENT_F_LOW]) if len(f) > _TENCENT_F_LOW and f[_TENCENT_F_LOW] else None,
             'change_pct': float(f[_TENCENT_F_CHANGE_PCT]) if len(f) > _TENCENT_F_CHANGE_PCT and f[_TENCENT_F_CHANGE_PCT] else None,
+            'quote_ts': _cn_timestamp(
+                f[_TENCENT_F_DATE] if len(f) > _TENCENT_F_DATE else '',
+                f[_TENCENT_F_TIME] if len(f) > _TENCENT_F_TIME else '',
+            ),
         }
     except (ValueError, IndexError):
         return None
@@ -871,6 +939,10 @@ def get_quotes_sina_batch(codes):
                 'high': high,
                 'low': low,
                 'change_pct': change_pct,
+                'quote_ts': _cn_timestamp(
+                    fields[30] if len(fields) > 30 else '',
+                    fields[31] if len(fields) > 31 else '',
+                ),
             }
         except (ValueError, IndexError):
             continue
@@ -940,7 +1012,7 @@ def get_quotes_eastmoney_his_batch(codes):
     def _fetch_one(secid):
         url = (
             f'http://push2his.eastmoney.com/api/qt/stock/get'
-            f'?secid={secid}&fields=f43,f44,f45,f46,f58,f60,f170'
+            f'?secid={secid}&fields=f43,f44,f45,f46,f58,f60,f170,f124'
         )
         req = urllib.request.Request(url, headers={
             'User-Agent': 'Mozilla/5.0',
@@ -980,6 +1052,7 @@ def get_quotes_eastmoney_his_batch(codes):
                 'high': _f(d.get('f44'), scale),
                 'low': _f(d.get('f45'), scale),
                 'change_pct': _f(d.get('f170'), 100),  # 涨跌幅统一 ÷100
+                'quote_ts': _epoch_seconds(d.get('f124')),
             }
     return results
 
@@ -1007,7 +1080,7 @@ def get_quotes_eastmoney_batch(codes):
     secids_str = ','.join(secids)
     url = (
         f'https://push2.eastmoney.com/api/qt/ulist.np/get'
-        f'?fltt=2&fields=f2,f3,f12,f13,f14,f15,f16,f17,f18'
+        f'?fltt=2&fields=f2,f3,f12,f13,f14,f15,f16,f17,f18,f124'
         f'&secids={secids_str}'
     )
     req = urllib.request.Request(url, headers={
@@ -1057,6 +1130,7 @@ def get_quotes_eastmoney_batch(codes):
             'high': _safe_float(item.get('f15')),
             'low': _safe_float(item.get('f16')),
             'change_pct': _safe_float(item.get('f3')),
+            'quote_ts': _epoch_seconds(item.get('f124')),
         }
     return results
 
@@ -1136,8 +1210,29 @@ def get_quotes_wscn_batch(codes):
             'high': high,
             'low': low,
             'change_pct': pct,
+            'quote_ts': _epoch_seconds(row[idx['update_time']]) if 'update_time' in idx and idx['update_time'] < len(row) else None,
         }
     return results
+
+
+def _ths_realhead_symbol(canonical):
+    """把规范 A 股代码转成同花顺 realhead 接口的 symbol（路径 ``hs_<symbol>``）。
+
+    同花顺的指数与个股共用 ``hs_`` 路径，但指数另有内部编码，且会与个股撞号：
+      - 上证指数 sh000001 → 1A0001（1A 系列专用于上证指数）
+      - 其它沪市指数 sh000xxx → 1B + 后 4 位
+        （沪深300 000300 → 1B0300、上证50 000016 → 1B0016、
+         科创50 000688 → 1B0688，均已实测可用）
+      - 深市指数 sz399xxx → 6 位数字本身（深证成指 399001、创业板指 399006）
+      - 个股 → 6 位数字本身
+
+    为什么必须单独映射：若把 sh000001 直接按 ``000001`` 请求，同花顺会返回
+    平安银行（约 11 元），上证指数 3500 点就被错显示成 11.x（真实故障）。
+    """
+    digits = canonical[2:]
+    if canonical.startswith('sh') and digits.startswith('000'):
+        return '1A0001' if digits == '000001' else '1B' + digits[2:]
+    return digits
 
 
 def get_quote_10jqka(code):
@@ -1148,7 +1243,8 @@ def get_quote_10jqka(code):
     盘前最新价可能为 0，用买1/卖1兜底（与新浪同口径）。
     """
     canonical = require_a_share_code(code)
-    url = f'http://d.10jqka.com.cn/v2/realhead/hs_{canonical[2:]}/last.js'
+    symbol = _ths_realhead_symbol(canonical)
+    url = f'http://d.10jqka.com.cn/v2/realhead/hs_{symbol}/last.js'
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     with _HTTP_OPENER.open(req, timeout=3) as resp:
         body = resp.read().decode('utf-8', errors='replace')
@@ -1180,6 +1276,7 @@ def get_quote_10jqka(code):
         'high': high,
         'low': low,
         'change_pct': change_pct,
+        'quote_ts': _parse_cn_quote_time(obj.get('time')),
     }
 
 
@@ -1242,6 +1339,7 @@ def get_quote_sse(code):
         'high': high,
         'low': low,
         'change_pct': change_pct,
+        'quote_ts': _cn_timestamp(data.get('date'), data.get('time')),
     }
 
 
@@ -1334,9 +1432,8 @@ def get_quotes_batch(codes, source='auto', host=None):
     available_sources = [s for s in A_SHARE_SOURCES
                          if _source_available(s) and _source_coverable_codes(s, canonical_codes)]
     if not available_sources:
-        # 极端情况：所有源都被屏蔽了，还是退化为全量轮询避免死锁
-        available_sources = [s for s in A_SHARE_SOURCES
-                             if _source_coverable_codes(s, canonical_codes)] or list(A_SHARE_SOURCES)
+        # 全源冷却中时保持冷却，不能每轮立即重试，否则 300 秒屏蔽形同虚设。
+        return {}
     global _a_share_cursor
     with _a_share_cursor_lock:
         idx = _a_share_cursor
@@ -1361,17 +1458,24 @@ def get_quotes_batch(codes, source='auto', host=None):
     else:
         _source_mark_fail(cur_source, f'(结果: {len(batch_results)}/{len(coverage)})')
 
-    # 当前源获取不全的，优先用腾讯补充（腾讯作为兜底基准）
-    missing = [c for c in canonical_codes if c not in batch_results]
-    # 补齐前先确认 tencent 未被屏蔽，否则对已知坏源重试只会拖慢补齐
-    if missing and _source_available('tencent'):
+    # 当前源缺记录或缺涨跌幅时都用备用腾讯源补齐；百分比预警不能静默跳过。
+    missing = [c for c in canonical_codes
+               if c not in batch_results
+               or not _is_usable_quote(batch_results[c], require_change_pct=True)]
+    fallback_source = 'tencent_sqt' if cur_source == 'tencent' else 'tencent'
+    if missing and _source_available(fallback_source):
         try:
-            tencent_fill = _filter_valid_quotes(get_quotes_tencent_batch(missing))
+            fallback_fill = _filter_valid_quotes(source_funcs[fallback_source](missing))
         except Exception:
-            tencent_fill = {}
+            fallback_fill = {}
+        if _batch_has_valid_result(fallback_fill, missing):
+            _source_mark_success(fallback_source)
+        else:
+            _source_mark_fail(
+                fallback_source, f'(兜底结果: {len(fallback_fill)}/{len(missing)})')
         for c in missing:
-            if c in tencent_fill:
-                batch_results[c] = tencent_fill[c]
+            if c in fallback_fill:
+                batch_results[c] = fallback_fill[c]
 
     return _map_results_to_input(batch_results, original_by_canonical)
 
@@ -1586,6 +1690,11 @@ def check_single(code, name, target, direction, interval, log_file,
                 continue
             name = q['name']
             now = datetime.datetime.now().strftime('%H:%M:%S')
+            if not is_a_share_trading_time() or quote_is_stale(q):
+                alerted = False
+                print(f'[{now}] 非交易时段或行情已过期，跳过预警')
+                time.sleep(interval)
+                continue
             check_count += 1
 
             triggered = False
@@ -1713,6 +1822,10 @@ def check_multi(config_file, source='tdx', host=None, notify='popup'):
                     print(f'[{now_str}] {name}({code}) Price is None, skipping')
                     continue
                 name = q.get('name', name)
+                if not is_a_share_trading_time() or quote_is_stale(q):
+                    _update_direction_latches(alert_latches, code, False, False)
+                    print(f'[{now_str}] {name}({code}) 非交易时段或行情已过期，跳过预警')
+                    continue
 
                 below_hit = alert_below and price <= target
                 above_hit = alert_above and price >= target
@@ -1734,6 +1847,7 @@ def check_multi(config_file, source='tdx', host=None, notify='popup'):
                         if notify == 'popup':
                             show_popup_async('价格预警', reason)
                 else:
+                    _update_direction_latches(alert_latches, code, False, False)
                     diff = price - target
                     print(f'[{now_str}] {name} = {format_price(code, price)} '
                           f'(target: {format_price(code, target)}, '

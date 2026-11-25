@@ -38,6 +38,8 @@ LIVE_API = 'https://api.alpaca.markets/v2'           # 交易 API 实盘地址�
 FEED = 'iex'                    # 免费版唯一可用的实时口径
 MAX_REQ_PER_MIN = 180           # 官方 200/分钟，留 20 次余量避免 429
 SNAPSHOT_TTL = 60               # 快照缓存有效期（秒）：休市时价格不变，不必每轮请求
+SNAPSHOT_RETRY_BACKOFF = 60     # 单只股票缺失/请求失败后的重试间隔
+SNAPSHOT_QUOTE_MAX_AGE = 300     # 最新报价事件超过 5 分钟不作为实时价
 SYMBOLS_PER_BATCH = 250         # Alpaca 批量 symbols 单次上限
 # 盘前盘后用买卖中值当现价的前提：价差够窄。实测（ET 05:28 盘前）AAPL
 # bp=325.91 / ap=360.46（价差 10%）且无成交，中值 343.19 比昨收低 1.1%，
@@ -262,8 +264,9 @@ def _resolve_prev_close(bars_desc, now_et=None):
 
 
 def _fetch_daily_bars(codes):
-    """批量拉最近 2 根日K（降序），返回 {symbol: [bar, ...]}，失败的不含在内"""
+    """批量拉最近 2 根日K（降序），返回 ({symbol: [bar, ...]}, 请求失败的 symbol 集)"""
     out = {}
+    failed = set()
     # 必须显式传 start：实测不传 start 时 Alpaca 返回 bars=null（空），
     # 40 自然日足够覆盖 2 根日K（长假/停牌也够）
     start = (datetime.datetime.now(TZ_ET) - datetime.timedelta(days=40)).date().isoformat()
@@ -279,16 +282,19 @@ def _fetch_daily_bars(codes):
             'start': start,                   # 实测缺省 start 会返回空，必须给
         })
         bars_map = (data or {}).get('bars')
-        if isinstance(bars_map, dict):
+        if data is None:
+            failed.update(sym.upper() for sym in chunk)
+        elif isinstance(bars_map, dict):
             for sym, rows in bars_map.items():
                 if rows:
                     out[sym.upper()] = rows
-    return out
+    return out, failed
 
 
 def _fetch_latest_quotes(codes):
-    """批量拉最新报价（含盘前盘后），返回 {symbol: quote_dict}"""
+    """批量拉最新报价（含盘前盘后），返回 ({symbol: quote_dict}, 请求失败的 symbol 集)"""
     out = {}
+    failed = set()
     for i in range(0, len(codes), SYMBOLS_PER_BATCH):
         chunk = codes[i:i + SYMBOLS_PER_BATCH]
         data = _http_get('/stocks/quotes/latest', {
@@ -296,11 +302,13 @@ def _fetch_latest_quotes(codes):
             'feed': FEED,
         })
         q_map = (data or {}).get('quotes')
-        if isinstance(q_map, dict):
+        if data is None:
+            failed.update(sym.upper() for sym in chunk)
+        elif isinstance(q_map, dict):
             for sym, q in q_map.items():
-                if q:
+                if isinstance(q, dict) and q:
                     out[sym.upper()] = q
-    return out
+    return out, failed
 
 
 def pick_quote_price(bp, ap, last_trade=None, ref=None):
@@ -346,41 +354,87 @@ def _quote_price(q, ref=None):
 # 快照批量（休市兜底：最近收盘价 + 涨跌幅）
 # ============================================================
 _snap_lock = threading.Lock()
+_snap_fetch_lock = threading.Lock()   # 串行化 REST 快照请求，避免旧响应覆盖新结果
 _snap_cache = {}                  # {symbol: snapshot}
-_snap_ts = 0.0                    # 上次全量刷新时间
+_snap_ts = 0.0                    # 上次请求 codes 全部成功的时间
+_snap_fresh_ts = {}               # {symbol: 该 symbol 最近一次成功刷新时间}
+_snap_retry_after = {}            # {symbol: 缺失/失败后的下一次可请求时间}
+
+
+def _snapshot_results_locked(codes, now):
+    """只返回本次请求的缓存；超过 TTL 或处于失败退避期的旧值明确标 stale。"""
+    out = {}
+    for code in codes:
+        snap = _snap_cache.get(code)
+        if snap is None:
+            continue
+        age = now - _snap_fresh_ts.get(code, 0.0)
+        item = dict(snap)
+        item['stale'] = bool(snap.get('stale')) or (
+            not (0 <= age < SNAPSHOT_TTL) or now < _snap_retry_after.get(code, 0.0)
+        )
+        out[code] = item
+    return out
 
 
 def latest_snapshot_batch(codes, force=False):
     """批量获取美股最新价快照（REST 兜底路径）
 
-    返回 {code: {'price','yest_close','change_pct'}}，取不到的不含在结果里。
-    TTL 内直接回缓存 —— 休市时价格不变，避免浪费免费版 200/分钟配额。
-    force=True 时强制刷新（如 WebSocket 每次连上后要拿一次最新昨收）。
+    返回 {code: {'price','yest_close','change_pct','stale'}}；取不到的不含在结果里。
+    每只股票独立缓存 TTL，缺失/请求失败后退避 60 秒；旧缓存可用但一定标 stale=True。
+    force=True 绕过新鲜 TTL（如 WebSocket 每次连上后要拿一次最新昨收），
+    但缺失/失败退避仍生效，避免强制补拉高频击穿配额。
+    请求整体串行，避免并发调用时旧响应或迟到失败覆盖新结果。
     """
-    global _snap_ts
-    codes = [c.upper() for c in codes if c]
+    codes = list(dict.fromkeys(c.upper() for c in codes if c))
     if not codes or not has_credentials():
         return {}
+    with _snap_fetch_lock:
+        return _latest_snapshot_batch_serialized(codes, force)
 
+
+def _latest_snapshot_batch_serialized(codes, force):
+    global _snap_ts
     now = time.time()
     with _snap_lock:
-        fresh = (now - _snap_ts) < SNAPSHOT_TTL
-        if fresh and all(c in _snap_cache for c in codes) and not force:
-            return dict(_snap_cache)  # 缓存整体拷出（只会被读，不会被改）
+        due = []
+        for code in codes:
+            fresh = 0 <= now - _snap_fresh_ts.get(code, 0.0) < SNAPSHOT_TTL
+            if (force or not fresh) and now >= _snap_retry_after.get(code, 0.0):
+                due.append(code)
+        if not due:
+            return _snapshot_results_locked(codes, now)
 
-    daily = _fetch_daily_bars(codes)
-    quotes = _fetch_latest_quotes(codes)
+    daily, daily_failed = _fetch_daily_bars(due)
+    quotes, quotes_failed = _fetch_latest_quotes(due)
     now_et = datetime.datetime.now(TZ_ET)
     in_window = in_us_data_window(now_et)      # 窗口内用实时报价，窗口外用收盘价
 
     updated = {}
-    for sym in codes:
+    failed = daily_failed | quotes_failed
+    for sym in due:
+        if sym in failed:
+            continue                        # 任一接口失败都不用另一接口的旧价冒充新鲜快照
         bars = daily.get(sym)
         prev, latest_close = _resolve_prev_close(bars, now_et) if bars else (None, None)
         if prev is not None:
             _set_prev_close(sym, prev)
 
-        price = _quote_price(quotes.get(sym) or {}, ref=latest_close)
+        quote = quotes.get(sym)
+        if in_window and not isinstance(quote, dict):
+            continue                            # 畸形/缺失报价进入退避，不拖垮同批其它股票
+        quote = quote if isinstance(quote, dict) else {}
+        quote_price = _quote_price(quote, ref=latest_close)
+        if in_window and sym not in quotes:
+            continue                            # 缺报价进入 60s 退避，不用收盘价冒充成功刷新
+        price = quote_price
+        quote_time = _parse_iso(quote.get('t'))
+        quote_ts = quote_time.timestamp() if quote_time else None
+        stale = not in_window or quote_price is None
+        if in_window and quote_ts is not None:
+            stale = stale or now - quote_ts > SNAPSHOT_QUOTE_MAX_AGE or quote_ts - now > 60
+        elif in_window:
+            stale = True
         # 休市（数据窗口外）优先用最近收盘价（选项6-A）：
         # 盘后报价的买卖价差可能极宽（实测 AAPL 周五盘后 bp=328.76/ap=363.43，
         # 中值 346 严重偏离收盘 343.39），窗口外用中值会显示"错价"
@@ -401,16 +455,27 @@ def latest_snapshot_batch(codes, force=False):
             'price': price,
             'yest_close': base,
             'change_pct': change_pct,
+            'stale': stale,
+            'quote_ts': quote_ts,
         }
 
     # 合并进缓存（失败的 symbol 保留旧值，避免网络抖动时价格闪烁为 '--'）
     with _snap_lock:
         _snap_cache.update(updated)
-        _snap_ts = now
+        unresolved = set(due) - set(updated)
+        for sym in updated:
+            _snap_fresh_ts[sym] = now
+            _snap_retry_after.pop(sym, None)
+        for sym in unresolved:
+            _snap_retry_after[sym] = now + SNAPSHOT_RETRY_BACKOFF
+        if not unresolved and not failed:
+            _snap_ts = now
         if len(_snap_cache) > 300:              # 防无界增长
-            for k in list(_snap_cache)[:-100]:
-                _snap_cache.pop(k, None)
-        return dict(_snap_cache)
+            for key in list(_snap_cache)[:-100]:
+                _snap_cache.pop(key, None)
+                _snap_fresh_ts.pop(key, None)
+                _snap_retry_after.pop(key, None)
+        return _snapshot_results_locked(codes, now)
 
 
 # ============================================================

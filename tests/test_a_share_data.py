@@ -93,6 +93,12 @@ def test_trading_time_uses_shanghai_timezone_and_sessions():
         datetime.datetime(2026, 11, 4, 13, 0)) is True
     assert price_alert.is_a_share_trading_time(
         datetime.datetime(2026, 11, 4, 15, 1)) is False
+    assert price_alert.is_a_share_trading_time(
+        datetime.datetime(2026, 11, 4, 15, 0, 0)) is True
+    assert price_alert.is_a_share_trading_time(
+        datetime.datetime(2026, 11, 4, 15, 0, 1)) is False
+    assert price_alert.is_a_share_trading_time(
+        datetime.datetime(2026, 11, 4, 11, 30, 1)) is False
 
     # UTC 01:30 == 上海 09:30，不能被本机时区带偏
     utc = datetime.datetime(2026, 11, 4, 1, 30, tzinfo=datetime.timezone.utc)
@@ -178,12 +184,14 @@ def test_invalid_primary_source_is_rejected_and_not_counted_as_success(monkeypat
         price_alert, 'get_quotes_tencent_batch',
         lambda codes: {c: {'price': 0, 'change_pct': 1.0} for c in codes},
     )
+    monkeypatch.setattr(price_alert, 'get_quotes_tencent_sqt_batch', lambda codes: {})
     monkeypatch.setattr(price_alert, '_a_share_cursor', 0)
 
     result = price_alert.get_quotes_batch(['sh600000'])
 
     assert result == {}
     assert price_alert.SOURCE_FAIL_COUNTS['tencent'] == 1
+    assert price_alert.SOURCE_FAIL_COUNTS['tencent_sqt'] == 1
     assert price_alert.get_source_health()['tencent']['available'] is True
 
 

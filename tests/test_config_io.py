@@ -111,6 +111,15 @@ def test_load_config_keeps_file_when_only_some_alerts_are_invalid(cfg_file):
     assert backups == []
 
 
+def test_normalize_config_repairs_malformed_alpaca_section():
+    assert fw.normalize_config({'alpaca': 'bad'})['alpaca'] == {'enabled': False}
+    assert fw.normalize_config({'alpaca': []})['alpaca'] == {'enabled': False}
+    config = fw.normalize_config({'alpaca': {
+        'enabled': 'false', 'api_key_enc': 'cipher', 'secret_enc': 'cipher'}})
+    assert config['alpaca'] == {
+        'enabled': False, 'api_key_enc': 'cipher', 'secret_enc': 'cipher'}
+
+
 def test_save_config_rejects_non_object_without_touching_file(cfg_file):
     assert fw.save_config(['not', 'a', 'config']) is False
     assert not os.path.exists(cfg_file)
